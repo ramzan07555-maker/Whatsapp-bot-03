@@ -4,14 +4,14 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-ID_INSTANCE = os.getenv("PHONE_NUMBER_ID", "710722695539")
-API_TOKEN = os.getenv("WHATSAPP_TOKEN", "5dcefdf92a5d46b69f4cd24d720a00fa5430a653a7be4d3687")
+ID_INSTANCE = "710722695539"
+API_TOKEN = "5dcefdf92a5d46b69f4cd24d720a00fa5430a653a7be4d3687"
 
 def send_whatsapp_message(chat_id, message_text):
-    """Green API හරහා නිවැරදිව මැසේජ් යැවීම"""
+    """Green API නිවැරදි URL එක හරහා මැසේජ් යැවීම"""
     try:
-        # Green API නිවැරදි Endpoints ෆෝමැට් එක
-        url = f"https://7107.api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
+        # Green API නිල ඩොකියුමෙන්ටේෂන් එකට අනුව නිවැරදි URL එක
+        url = f"https://api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
         
         payload = {
             "chatId": chat_id,
