@@ -22,12 +22,12 @@ if GROQ_API_KEY:
 GREEN_API_ID_INSTANCE = os.environ.get("GREEN_API_ID_INSTANCE")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
 
-# Binance API විස්තර (Demo / Testnet)
+# Binance Real Account API විස්තර සහ URL එක
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
-BINANCE_BASE_URL = "https://testnet.binance.vision"
+BINANCE_BASE_URL = "https://api.binance.com"
 
-# 👉 ඔබේ WhatsApp අංකය නිශ්චිතව යොදා ඇත
+# ඔබේ WhatsApp අංකය
 MY_WHATSAPP_NUMBER = "966572686730"
 
 def get_binance_signature(query_string):
@@ -54,7 +54,7 @@ def get_binance_account_balance():
         
         if "balances" in data:
             non_zero = [b for b in data["balances"] if float(b["free"]) > 0 or float(b["locked"]) > 0]
-            result_str = "📊 ඔබේ Binance Demo ගිණුමේ ශේෂය:\n"
+            result_str = "📊 ඔබේ Binance Real ගිණුමේ ශේෂය:\n"
             for b in non_zero:
                 result_str += f"- {b['asset']}: නිදහස්: {b['free']}, ලොක් වී ඇති: {b['locked']}\n"
             return result_str
@@ -71,11 +71,12 @@ def execute_auto_trade():
         url = f"{BINANCE_BASE_URL}/api/v3/order"
         timestamp = int(time.time() * 1000)
         
+        # Spot market එකේ අවම ප්‍රමාණයකට (ഉദാ: BTCUSDT) ට්‍රේඩ් එකක් සැකසීම
         params = {
             "symbol": "BTCUSDT",
             "side": "BUY",
             "type": "MARKET",
-            "quantity": "0.002",
+            "quantity": "0.0001",  # කුඩා ප්‍රමාණයක් සඳහා
             "timestamp": timestamp
         }
         query_string = urlencode(params)
@@ -86,7 +87,7 @@ def execute_auto_trade():
         data = response.json()
         
         if "orderId" in data:
-            return f"🚀 සාර්ථකයි! ස්වයංක්‍රීයව BTC ට්‍රේඩ් එකක් (BUY) ක්‍රියාත්මක විය. Order ID: {data['orderId']}"
+            return f"🚀 සාර්ථකයි! ලයිව් මාකට් එකේ BTC ට්‍රේඩ් එකක් (BUY) ක්‍රියාත්මක විය. Order ID: {data['orderId']}"
         else:
             return f"⚠️ ට්‍රේඩ් කිරීමේදී දෝෂයක් ඇති විය: {data.get('msg', data)}"
     except Exception as e:
@@ -94,7 +95,7 @@ def execute_auto_trade():
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "Private Trading Bot is Running 24/7!"
+    return "Private Real Trading Bot is Running 24/7!"
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -105,7 +106,7 @@ def webhook():
         if data.get("typeWebhook") == "incomingMessageReceived":
             sender = data.get("senderData", {}).get("chatId", "")
             
-            # වෙනත් අංක වලින් එන මැසේජ් සම්පූර්ණයෙන්ම මඟ හරියි (ඔයාගේ අංකයෙන් එන ඒවාට පමණක් ක්‍රියා කරයි)
+            # වෙනත් අංක වලින් එන මැසේජ් මඟ හරියි (ඔයාගේ අංකයෙන් එන ඒවාට පමණක් ක්‍රියා කරයි)
             if MY_WHATSAPP_NUMBER not in sender:
                 print(f"Ignored message from unauthorized user: {sender}")
                 return "OK", 200
