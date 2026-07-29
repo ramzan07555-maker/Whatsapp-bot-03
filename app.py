@@ -22,11 +22,13 @@ if GROQ_API_KEY:
 GREEN_API_ID_INSTANCE = os.environ.get("GREEN_API_ID_INSTANCE")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
 
-# Binance API විස්තර (Demo / Testnet සඳහා භාවිතා වේ)
-# සටහන: Testnet සඳහා Binance Testnet URL එක භාවිතා කිරීම වැදගත් වේ.
+# Binance API විස්තර (Demo / Testnet)
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
-BINANCE_BASE_URL = "https://testnet.binance.vision"  # ಡೆමෝ එකවුන්ට් සඳහා ටෙස්ට්නෙට් යූආර්එල් එක
+BINANCE_BASE_URL = "https://testnet.binance.vision"
+
+# 👉 ඔබේ WhatsApp අංකය නිශ්චිතව යොදා ඇත
+MY_WHATSAPP_NUMBER = "966572686730"
 
 def get_binance_signature(query_string):
     return hmac.new(
@@ -62,7 +64,6 @@ def get_binance_account_balance():
         return f"Binance Error: {str(e)}"
 
 def execute_auto_trade():
-    """ස්වයංක්‍රීයව ට්‍රේඩ් කිරීම සඳහා සාම්ප්‍රදායික Buy Order එකක් දැමීම (Demo Testnet)"""
     if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
         return "ට්‍රේඩ් කිරීමට Binance API Keys අවශ්‍ය වේ!"
     
@@ -70,7 +71,6 @@ def execute_auto_trade():
         url = f"{BINANCE_BASE_URL}/api/v3/order"
         timestamp = int(time.time() * 1000)
         
-        # උදාහරණයක් ලෙස BTCUSDT වලින් කුඩා ප්‍රමාණයක් (0.002ක් වැනි) මිලදී ගැනීම (BUY)
         params = {
             "symbol": "BTCUSDT",
             "side": "BUY",
@@ -94,7 +94,7 @@ def execute_auto_trade():
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "Automated Auto-Trading WhatsApp Bot is Running 24/7!"
+    return "Private Trading Bot is Running 24/7!"
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -104,31 +104,33 @@ def webhook():
         
         if data.get("typeWebhook") == "incomingMessageReceived":
             sender = data.get("senderData", {}).get("chatId", "")
-            message_data = data.get("messageData", {})
             
+            # වෙනත් අංක වලින් එන මැසේජ් සම්පූර්ණයෙන්ම මඟ හරියි (ඔයාගේ අංකයෙන් එන ඒවාට පමණක් ක්‍රියා කරයි)
+            if MY_WHATSAPP_NUMBER not in sender:
+                print(f"Ignored message from unauthorized user: {sender}")
+                return "OK", 200
+
+            message_data = data.get("messageData", {})
             message_text = ""
             if message_data.get("typeMessage") == "textMessage":
                 message_text = message_data.get("textMessageData", {}).get("textMessage", "")
             elif message_data.get("typeMessage") == "extendedTextMessage":
                 message_text = message_data.get("extendedTextMessageData", {}).get("text", "")
 
-            print(f"Sender: {sender}, Message: {message_text}")
+            print(f"Sender (Authorized): {sender}, Message: {message_text}")
 
             if sender and message_text:
                 ai_reply = "සමාවෙන්න, මට දැන් උත්තර දෙන්න බැහැ."
                 text_lower = message_text.lower()
                 
-                # පරිශීලකයා ස්වයංක්‍රීය ට්‍රේඩිං අරඹන්න කීවොත්
-                if "start trading" import text_lower or "ට්‍රේඩ් කරන්න" in text_lower or "trade" in text_lower:
+                if "start trading" in text_lower or "ට්‍රේඩ් කරන්න" in text_lower or "trade" in text_lower:
                     ai_reply = execute_auto_trade()
-                # ශේෂය හෝ ලාභය බැලීමට
                 elif "profit" in text_lower or "ප්‍රොෆිට්" in text_lower or "balance" in text_lower or "ලාභය" in text_lower or "salli" in text_lower:
                     ai_reply = get_binance_account_balance()
                 else:
-                    # වෙනත් ප්‍රශ්න වලට Groq AI එක හරහා පිළිතුරු දීම
                     if client:
                         try:
-                            system_prompt = "You are an expert automated crypto trading bot manager. Answer user queries clearly in Sinhala or English depending on their input."
+                            system_prompt = "You are an expert automated crypto trading bot manager. Answer user queries clearly."
                             completion = client.chat.completions.create(
                                 model="llama-3.3-70b-versatile",
                                 messages=[
@@ -141,7 +143,6 @@ def webhook():
                         except Exception as e:
                             ai_reply = f"දෝෂයක් සිදු විය: {str(e)}"
 
-                # WhatsApp වෙත Green API හරහා පිළිතුර යැවීම
                 url = f"https://api.green-api.com/waInstance{GREEN_API_ID_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
                 payload = {
                     "chatId": sender,
