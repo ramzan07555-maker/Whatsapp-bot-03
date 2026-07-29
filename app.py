@@ -1,25 +1,26 @@
 import os
 from flask import Flask, request
-from google import genai
+from groq import Groq
 import requests
 
 app = Flask(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Groq API සෙටප් කිරීම (GEMINI_API_KEY වේරියබල් එකටම Groq කී එක දෙන්න පුළුවන්)
+GROQ_API_KEY = os.environ.get("GEMINI_API_KEY")
 client = None
-if GEMINI_API_KEY:
+if GROQ_API_KEY:
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        print("Gemini Client Initialized Successfully")
+        client = Groq(api_key=GROQ_API_KEY)
+        print("Groq Client Initialized Successfully")
     except Exception as e:
-        print(f"Gemini Init Error: {e}")
+        print(f"Groq Init Error: {e}")
 
 GREEN_API_ID_INSTANCE = os.environ.get("GREEN_API_ID_INSTANCE")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
 
 @app.route("/", methods=["GET", "HEAD"])
 def home():
-    return "WhatsApp AI Bot is Running 24/7!"
+    return "WhatsApp Groq AI Bot is Running 24/7!"
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -43,17 +44,20 @@ def webhook():
                 ai_reply = "සමාවෙන්න, මට දැන් AI එකට සම්බන්ධ වෙන්න බැහැ."
                 if client:
                     try:
-                        print("Sending request to Gemini...")
-                        # මෙන්න මෙතන නිවැරදි gemini-2.0-flash මෝඩල් එක දමා ඇත
-                        response = client.models.generate_content(
-                            model="gemini-2.0-flash",
-                            contents=message_text,
+                        print("Sending request to Groq...")
+                        # ලෝකයේ වේගවත්ම සහ නොමිලේ දෙන Llama 3 මාදිලිය භාවිතා කිරීම
+                        completion = client.chat.completions.create(
+                            model="llama-3.3-70b-versatile",
+                            messages=[
+                                {"role": "user", "content": message_text}
+                            ],
+                            temperature=0.7,
                         )
-                        ai_reply = response.text
-                        print(f"Gemini Reply: {ai_reply}")
+                        ai_reply = completion.choices[0].message.content
+                        print(f"Groq Reply: {ai_reply}")
                     except Exception as e:
                         ai_reply = f"දෝෂයක් සිදු විය: {str(e)}"
-                        print(f"Gemini Error: {e}")
+                        print(f"Groq Error: {e}")
 
                 # WhatsApp වෙත Green API හරහා පිළිතුර යැවීම
                 url = f"https://api.green-api.com/waInstance{GREEN_API_ID_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
