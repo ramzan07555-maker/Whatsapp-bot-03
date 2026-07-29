@@ -5,16 +5,22 @@ import hmac
 import hashlib
 import base64
 import time
+from groq import Groq
 
 app = Flask(__name__)
 
+# API Keys & Tokens
 API_KEY = os.getenv("KUCOIN_API_KEY")
 API_SECRET = os.getenv("KUCOIN_API_SECRET")
 API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 ID_INSTANCE = "710722695539"
 API_TOKEN = "5dcefdf92a5d46b69f4cd24d720a00fa5430a653a7be4d3687"
 MY_PHONE_CHAT_ID = "966572686730@c.us"
+
+# Initialize Groq Client
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 def send_whatsapp_message(chat_id, message_text):
     try:
@@ -46,14 +52,12 @@ def get_kucoin_signature(endpoint, method, body=""):
         return None
 
 def execute_smart_trade():
-    """අවදානම පාලනය කරමින් ස්වයංක්‍රීයව මිලදී ගැනීම සහ විකිණීම පරීක්ෂා කිරීම"""
+    """මාකට් මිල සහ ගිණුමේ ශේෂය ලබා ගැනීම"""
     try:
-        # 1. වර්තමාන මාකට් මිල ලබා ගැනීම (BTC-USDT)
         price_url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=BTC-USDT"
         price_res = requests.get(price_url).json()
         current_price = float(price_res.get("data", {}).get("price", 0))
         
-        # 2. ගිණුමේ ශේෂය පරීක්ෂා කිරීම
         endpoint = "/api/v1/accounts"
         headers = get_kucoin_signature(endpoint, "GET")
         if not headers:
@@ -72,9 +76,6 @@ def execute_smart_trade():
                 elif acc.get("currency") == "BTC":
                     btc_balance = float(acc.get("available", 0))
         
-        # 3. ස්වයංක්‍රීය තීරණ ගැනීමේ පද්ධතිය (Risk-Managed Logic)
-        # උදාහරණයක් ලෙස: USDT ප්‍රමාණවත් නම් සහ මාකට් තත්ත්වය සුදුසු නම් පාලිතව BUY කිරීමේ ලොජික් එක මෙතැනට සම්බන්ධ කළ හැක.
-        
         report = (
             f"🤖 *Smart Auto-Trading Bot Status*:\n\n"
             f"📈 Current BTC Price: ${current_price}\n"
@@ -83,9 +84,32 @@ def execute_smart_trade():
             f"⚙️ *Risk Management*: Active (Loss Protection Enabled)\n"
             f"🛡️ Bot is monitoring the market 24/7 for safe entries."
         )
-        return report
+        return report, current_price, usdt_balance, btc_balance
     except Exception as e:
-        return f"Trading Error: {str(e)}"
+        return f"Trading Error: {str(e)}", 0, 0, 0
+
+def ask_groq_ai(prompt, market_data):
+    """Groq AI හරහා ස්මාර්ට් පිළිතුරු සකස් කිරීම"""
+    if not groq_client:
+        return "Groq AI is not configured."
+    
+    system_prompt = (
+        f"You are an expert crypto trading assistant. Current market and account data: {market_data}. "
+        "Answer the user's question intelligently, professionally, and concisely in Sinhala or English depending on user input."
+    )
+    
+    try:
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.7,
+        )
+        return chat_completion.choices[0].message.content
+    except Exception as e:
+        return f"AI Error: {str(e)}"
 
 @app.route('/', methods=['POST'])
 @app.route('/webhook', methods=['POST'])
@@ -95,20 +119,24 @@ def webhook():
         if "messageData" in data:
             msg_data = data["messageData"]
             if msg_data.get("typeMessage") == "textMessage":
-                msg_body = msg_data.get("textMessageData", {}).get("textMessage", "").strip().lower()
+                msg_body = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
+                msg_lower = msg_body.lower()
                 chat_id = data.get("senderData", {}).get("chatId", "")
                 
                 if chat_id != MY_PHONE_CHAT_ID:
                     return "OK", 200
-                if "smart auto-trading bot status" in msg_body:
+                if "smart auto-trading bot status" in msg_lower or "ai error" in msg_lower:
                     return "OK", 200
                 
-                if "status" in msg_body or "trade" in msg_body or "pnl" in msg_body or "profit" in msg_body:
-                    reply_text = execute_smart_trade()
-                elif "hi" in msg_body or "hello" in msg_body:
-                    reply_text = "Smart Trading Bot is online 24/7! Send 'status' to check market and risk-managed portfolio."
+                # දත්ත ලබා ගැනීම
+                status_report, price, usdt, btc = execute_smart_trade()
+                market_info = f"BTC Price: ${price}, USDT Balance: {usdt}, BTC Balance: {btc}"
+                
+                if "status" in msg_lower or "balance" in msg_lower or "trade" in msg_lower:
+                    reply_text = status_report
                 else:
-                    reply_text = f"Received: '{msg_body}'. Send 'status' to check automated trading stats."
+                    # වෙනත් ඕනෑම ප්‍රශ්නයකට Groq AI එකෙන් ස්මාර්ට් පිළිතුරක් ලබා දීම
+                    reply_text = ask_groq_ai(msg_body, market_info)
                 
                 send_whatsapp_message(chat_id, reply_text)
     except Exception as e:
