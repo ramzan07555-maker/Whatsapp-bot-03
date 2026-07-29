@@ -4,16 +4,14 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-# Green API Credentials (හෝ ඔයා පාවිච්චි කරන ගේට්‌වේ විස්තර)
-# Green API එකේ නම් IDInstance සහ ApiTokenToken මෙතැනට දෙන්න ඕනේ
 ID_INSTANCE = os.getenv("PHONE_NUMBER_ID", "YOUR_INSTANCE_ID")
 API_TOKEN = os.getenv("WHATSAPP_TOKEN", "YOUR_API_TOKEN")
 
 def send_whatsapp_message(chat_id, message_text):
-    """Green API හෝ වෙනත් ගේට්‌වේ එක හරහා මැසේජ් යැවීම"""
+    """Green API හරහා නිවැරදිව මැසේජ් යැවීම"""
     try:
-        # Green API Endpoint (උදාහරණයක් ලෙස)
-        url = f"https://api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
+        # නිවැරදි Green API URL එක
+        url = f"https://7107.api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
         
         payload = {
             "chatId": chat_id,
@@ -21,7 +19,7 @@ def send_whatsapp_message(chat_id, message_text):
         }
         
         response = requests.post(url, json=payload)
-        print("Send response:", response.json())
+        print("Send response text:", response.text)
         return response.json()
     except Exception as e:
         print(f"Error sending message: {e}")
@@ -40,11 +38,10 @@ def webhook():
                 msg_body = msg_data.get("textMessageData", {}).get("textMessage", "")
                 
                 sender_data = data.get("senderData", {})
-                chat_id = sender_data.get("chatId", "") # සම්පූර්ණ chatId එක (උදා: 15551972217@c.us)
+                chat_id = sender_data.get("chatId", "")
                 
                 print(f"Message from {chat_id}: {msg_body}")
                 
-                # රිප්ලයි යැවීමේදී chatId එකම ලබා දීම
                 send_whatsapp_message(chat_id, f"Bot reply: {msg_body}")
                 
     except Exception as e:
