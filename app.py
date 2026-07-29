@@ -5,13 +5,15 @@ import requests
 
 app = Flask(__name__)
 
-# අලුත් Google GenAI ਕී එක සකස් කරගැනීම
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 client = None
 if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        print("Gemini Client Initialized Successfully")
+    except Exception as e:
+        print(f"Gemini Init Error: {e}")
 
-# Green API විස්තර
 GREEN_API_ID_INSTANCE = os.environ.get("GREEN_API_ID_INSTANCE")
 GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
 
@@ -23,6 +25,7 @@ def home():
 def webhook():
     try:
         data = request.json
+        print("--- Incoming Webhook Data ---")
         
         if data.get("typeWebhook") == "incomingMessageReceived":
             sender = data.get("senderData", {}).get("chatId", "")
@@ -34,18 +37,22 @@ def webhook():
             elif message_data.get("typeMessage") == "extendedTextMessage":
                 message_text = message_data.get("extendedTextMessageData", {}).get("text", "")
 
+            print(f"Sender: {sender}, Message: {message_text}")
+
             if sender and message_text:
                 ai_reply = "සමාවෙන්න, මට දැන් AI එකට සම්බන්ධ වෙන්න බැහැ."
                 if client:
                     try:
-                        # අලුත් ක්‍රමයට Gemini 2.5 හෝ Flash ආධාරයෙන් රිප්ලයි ලබා ගැනීම
+                        print("Sending request to Gemini...")
                         response = client.models.generate_content(
                             model="gemini-2.5-flash",
                             contents=message_text,
                         )
                         ai_reply = response.text
+                        print(f"Gemini Reply: {ai_reply}")
                     except Exception as e:
                         ai_reply = f"දෝෂයක් සිදු විය: {str(e)}"
+                        print(f"Gemini Error: {e}")
 
                 # WhatsApp වෙත Green API හරහා පිළිතුර යැවීම
                 url = f"https://api.green-api.com/waInstance{GREEN_API_ID_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
@@ -54,11 +61,13 @@ def webhook():
                     "message": ai_reply
                 }
                 headers = {'Content-Type': 'application/json'}
-                requests.post(url, json=payload, headers=headers)
+                print(f"Sending response to Green API for chatId: {sender}")
+                resp = requests.post(url, json=payload, headers=headers)
+                print(f"Green API Send Response: {resp.status_code} - {resp.text}")
 
         return "OK", 200
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Webhook Main Error: {e}")
         return "OK", 200
 
 if __name__ == "__main__":
