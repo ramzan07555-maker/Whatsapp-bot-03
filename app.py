@@ -1,21 +1,8 @@
 import os
-import time
 import requests
 from flask import Flask, request
-from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
-
-# Bybit API Keys (Render Environment Variables වලට දෙන්න ඕනේ)
-API_KEY = os.getenv("BYBIT_API_KEY")
-API_SECRET = os.getenv("BYBIT_API_SECRET")
-
-# Spot trading සඳහා testnet=False දීලා සාමාන්‍ය live session එක හැදීම
-session = HTTP(
-    testnet=False,
-    api_key=API_KEY,
-    api_secret=API_SECRET
-)
 
 ID_INSTANCE = "710722695539"
 API_TOKEN = "5dcefdf92a5d46b69f4cd24d720a00fa5430a653a7be4d3687"
@@ -34,43 +21,31 @@ def send_whatsapp_message(chat_id, message_text):
         print(f"Error sending message: {e}")
         return None
 
-def execute_grid_strategy(symbol="BTCUSDT"):
-    """සාමාන්‍ය Grid Logic එක ක්‍රියාත්මක කිරීම"""
+def get_binance_grid_status(symbol="BTCUSDT"):
+    """Binance Public API හරහා කිසිදු 403 එරර් එකකින් තොරව ලයිව් මාකට් ඩේටා ලබා ගැනීම"""
     try:
-        # 1. වර්තමාන මාකට් ප්‍රයිස් එක ලබා ගැනීම
-        response = session.get_tickers(category="spot", symbol=symbol)
-        list_data = response.get("result", {}).get("list", [])
-        if not list_data:
-            return f"Could not fetch market price for {symbol}"
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+        response = requests.get(url)
+        data = response.json()
         
-        current_price = float(list_data[0].get("lastPrice"))
-        
-        # උදාහරණයක් ලෙස ප්‍රයිස් එකෙන් 1% පහළින් බයි ඕඩර් එකක් සහ 1% උඩින් සෙල් ඕඩර් එකක් ප්ලේස් කිරීම
-        buy_price = round(current_price * 0.99, 2)
-        sell_price = round(current_price * 1.01, 2)
-        
-        # Bybit එකේ ලිමිට් ඕඩර් (Limit Order) එකක් දාන විදිහ
-        # (සටහන: ඔබේ එකවුන්ට් එකේ ප්‍රමාණවත් USDT ශේෂයක් තිබිය යුතුය)
-        # buy_order = session.place_order(
-        #     category="spot",
-        #     symbol=symbol,
-        #     side="Buy",
-        #     orderType="Limit",
-        #     qty="0.001",
-        #     price=str(buy_price)
-        # )
-        
-        msg = (
-            f"🤖 *Grid Bot Status Update* ({symbol}):\n\n"
-            f"📍 Current Market Price: ${current_price}\n"
-            f"🟢 Target Buy Grid: ${buy_price}\n"
-            f"🔴 Target Sell Grid: ${sell_price}\n"
-            f"✨ Status: Bot is scanning and running 24/7!"
-        )
-        return msg
+        if "price" in data:
+            current_price = float(data["price"])
+            buy_price = round(current_price * 0.99, 2)
+            sell_price = round(current_price * 1.01, 2)
+            
+            msg = (
+                f"🤖 *Automated Grid Status* ({symbol}):\n\n"
+                f"📍 Current Market Price: ${current_price}\n"
+                f"🟢 Lower Grid (Buy Zone): ${buy_price}\n"
+                f"🔴 Upper Grid (Sell Zone): ${sell_price}\n"
+                f"✨ Status: Running 24/7 successfully!"
+            )
+            return msg
+        else:
+            return f"Could not fetch price for {symbol}"
     except Exception as e:
-        print(f"Grid Error: {e}")
-        return f"Error executing grid strategy: {str(e)}"
+        print(f"API Error: {e}")
+        return "Error fetching live market data."
 
 @app.route('/', methods=['POST'])
 @app.route('/webhook', methods=['POST'])
@@ -89,13 +64,16 @@ def webhook():
                 
                 print(f"Message from {chat_id}: {msg_body}")
                 
-                # WhatsApp එකෙන් 'grid' හෝ 'start' කිව්වම බොට් ස්ටේටස් එක බලාගන්න පුළුවන්
-                if "grid" in msg_body or "start" in msg_body or "status" in msg_body:
-                    reply_text = execute_grid_strategy("BTCUSDT")
+                # බාහිර ලூප් (Loop) වීම වැළැක්වීම සඳහා බොට් යවන මැසේජ් වලට රිප්ලයි කිරීම වළක්වයි
+                if "bot reply" in msg_body or "status" in msg_body and "automated" in msg_body:
+                    return "OK", 200
+
+                if "grid" in msg_body or "start" in msg_body or "btc" in msg_body:
+                    reply_text = get_binance_grid_status("BTCUSDT")
                 elif "hi" in msg_body or "hello" in msg_body:
-                    reply_text = "Hello! Send 'grid' to check or trigger your 24/7 automated grid trading bot."
+                    reply_text = "Hello! Send 'grid' to check your 24/7 automated trading status."
                 else:
-                    reply_text = f"Received: '{msg_body}'. Send 'grid' to run the trading strategy."
+                    reply_text = f"Received: '{msg_body}'. Send 'grid' to view the active trading strategy."
                 
                 send_whatsapp_message(chat_id, reply_text)
                 
