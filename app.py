@@ -32,11 +32,12 @@ def send_whatsapp_message(chat_id, message_text):
         return None
 
 def get_kucoin_signature(endpoint, method, body=""):
-    """KuCoin Signed API ඉල්ලීම් සඳහා Signature එක සකස් කිරීම"""
+    """KuCoin V2 API සඳහා නිවැරදි Signature එක සකස් කිරීම"""
     try:
         header_timestamp = str(int(time.time() * 1000))
-        str_to_sign = header_timestamp + method + endpoint + body
+        str_to_sign = header_timestamp + method.upper() + endpoint + body
         
+        # HMAC-SHA256 සහ Base64 කේතනය නිවැරදිව සිදු කිරීම
         signature = base64.b64encode(
             hmac.new(API_SECRET.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest()
         ).decode('utf-8')
@@ -59,7 +60,7 @@ def get_kucoin_signature(endpoint, method, body=""):
         return None
 
 def get_account_status():
-    """ගිණුමේ බැලන්ස් සහ ට්‍රේඩින් තත්ත්වය පරීක්ෂා කිරීම"""
+    """ගිණුමේ බැලන්ස් සහ මාකට් තත්ත්වය ලබා ගැනීම"""
     try:
         endpoint = "/api/v1/accounts"
         headers = get_kucoin_signature(endpoint, "GET")
@@ -78,10 +79,10 @@ def get_account_status():
         if data.get("code") == "200000":
             accounts = data.get("data", [])
             msg = (
-                f"🤖 *KuCoin Autonomous Bot Status*:\n\n"
-                f"📈 Current BTC Market Price: ${current_btc_price}\n"
-                f"⚙️ Bot Mode: 24/7 Active & Monitoring\n\n"
-                f"💰 *Account Balances (Trade Account)*:\n"
+                f"🤖 *KuCoin Bot Status*:\n\n"
+                f"📈 Current BTC Price: ${current_btc_price}\n"
+                f"⚙️ Status: Connected Successfully!\n\n"
+                f"💰 *Trade Account Balances*:\n"
             )
             has_funds = False
             for acc in accounts:
@@ -117,21 +118,18 @@ def webhook():
                 
                 print(f"Message from {chat_id}: {msg_body}")
                 
-                # වෙනත් අංක වලින් එන මැසේජ් නොසලකා හැරීම
                 if chat_id != MY_PHONE_CHAT_ID:
                     return "OK", 200
 
-                # බොට් යවන මැසේජ් වලට නැවත රිප්ලයි වීම වැළැක්වීම
-                if "kucoin autonomous bot status" in msg_body:
+                if "kucoin bot status" in msg_body:
                     return "OK", 200
 
-                # ඔයා WhatsApp එකෙන් යවන කමාන්ඩ් එකට අනුව ප්‍රතිචාර දැක්වීම
                 if "status" in msg_body or "balance" in msg_body or "profit" in msg_body or "pnl" in msg_body or "grid" in msg_body:
                     reply_text = get_account_status()
                 elif "hi" in msg_body or "hello" in msg_body:
-                    reply_text = "Bot is running 24/7! Send 'status' to check your portfolio, balances, and market price."
+                    reply_text = "Bot is active! Send 'status' to check your KuCoin account and balances."
                 else:
-                    reply_text = f"Received: '{msg_body}'. Send 'status' to check your active trading and account details."
+                    reply_text = f"Received: '{msg_body}'. Send 'status' to check your trading account."
                 
                 send_whatsapp_message(chat_id, reply_text)
                 
