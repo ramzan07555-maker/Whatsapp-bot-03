@@ -44,8 +44,9 @@ def webhook():
                 if client:
                     try:
                         print("Sending request to Gemini...")
+                        # මෙන්න මෙතන නිවැරදි gemini-2.0-flash මෝඩල් එක දමා ඇත
                         response = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model="gemini-2.0-flash",
                             contents=message_text,
                         )
                         ai_reply = response.text
