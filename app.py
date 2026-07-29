@@ -1,162 +1,94 @@
 import os
-from flask import Flask, request
-from groq import Groq
-import requests
-import hmac
-import hashlib
+import threading
 import time
-from urllib.parse import urlencode
+from pybit.unified_trading import HTTP
+from flask import Flask, request
+
+# Bybit API Keys
+API_KEY = os.getenv("BYBIT_API_KEY")
+API_SECRET = os.getenv("BYBIT_API_SECRET")
+
+session = HTTP(
+    testnet=False,
+    api_key=API_KEY,
+    api_secret=API_SECRET
+)
 
 app = Flask(__name__)
 
-# Groq API සෙටප් කිරීම
-GROQ_API_KEY = os.environ.get("GEMINI_API_KEY")
-client = None
-if GROQ_API_KEY:
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        print("Groq Client Initialized Successfully")
-    except Exception as e:
-        print(f"Groq Init Error: {e}")
+# **ඔයාගේ නම්බර් එක විතරයි මෙතන තියෙන්නේ (වෙන කිසිම කෙනෙකුට රිප්لای නොකිරීම සඳහා)**
+MY_PHONE_NUMBER = "966572686730"
 
-GREEN_API_ID_INSTANCE = os.environ.get("GREEN_API_ID_INSTANCE")
-GREEN_API_TOKEN = os.environ.get("GREEN_API_TOKEN")
-
-# Binance Real Account API විස්තර සහ URL එක
-BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
-BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
-BINANCE_BASE_URL = "https://api.binance.com"
-
-# ඔබේ WhatsApp අංකය
-MY_WHATSAPP_NUMBER = "966572686730"
-
-def get_binance_signature(query_string):
-    return hmac.new(
-        BINANCE_SECRET_KEY.encode('utf-8'),
-        query_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-
-def get_binance_account_balance():
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        return "Binance API Keys සර්වර් එකේ සෙට් කරලා නැහැ!"
+# --- 1. දවසේ පැය 24 පුරාම ඔටෝ ට්‍රේඩ් කරන කොටස (Background Thread) ---
+def auto_trading_worker():
+    print("24/7 Auto Trading Bot Started in Background...")
+    symbol = "BTCUSDT"
     
-    try:
-        url = f"{BINANCE_BASE_URL}/api/v3/account"
-        timestamp = int(time.time() * 1000)
-        params = {"timestamp": timestamp}
-        query_string = urlencode(params)
-        signature = get_binance_signature(query_string)
-        
-        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-        response = requests.get(f"{url}?{query_string}&signature={signature}", headers=headers)
-        data = response.json()
-        
-        if "balances" in data:
-            non_zero = [b for b in data["balances"] if float(b["free"]) > 0 or float(b["locked"]) > 0]
-            result_str = "📊 ඔබේ Binance Real ගිණුමේ ශේෂය:\n"
-            for b in non_zero:
-                result_str += f"- {b['asset']}: නිදහස්: {b['free']}, ලොක් වී ඇති: {b['locked']}\n"
-            return result_str
-        else:
-            return f"Balance දත්ත ලබාගැනීමේ දෝෂයක්: {data}"
-    except Exception as e:
-        return f"Binance Error: {str(e)}"
-
-def execute_auto_trade():
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        return "ට්‍රේඩ් කිරීමට Binance API Keys අවශ්‍ය වේ!"
-    
-    try:
-        url = f"{BINANCE_BASE_URL}/api/v3/order"
-        timestamp = int(time.time() * 1000)
-        
-        # Spot market එකේ අවම ප්‍රමාණයකට (ഉദാ: BTCUSDT) ට්‍රේඩ් එකක් සැකසීම
-        params = {
-            "symbol": "BTCUSDT",
-            "side": "BUY",
-            "type": "MARKET",
-            "quantity": "0.0001",  # කුඩා ප්‍රමාණයක් සඳහා
-            "timestamp": timestamp
-        }
-        query_string = urlencode(params)
-        signature = get_binance_signature(query_string)
-        
-        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-        response = requests.post(f"{url}?{query_string}&signature={signature}", headers=headers)
-        data = response.json()
-        
-        if "orderId" in data:
-            return f"🚀 සාර්ථකයි! ලයිව් මාකට් එකේ BTC ට්‍රේඩ් එකක් (BUY) ක්‍රියාත්මක විය. Order ID: {data['orderId']}"
-        else:
-            return f"⚠️ ට්‍රේඩ් කිරීමේදී දෝෂයක් ඇති විය: {data.get('msg', data)}"
-    except Exception as e:
-        return f"Trade Execution Error: {str(e)}"
-
-@app.route("/", methods=["GET", "HEAD"])
-def home():
-    return "Private Real Trading Bot is Running 24/7!"
-
-@app.route("/", methods=["POST"])
-def webhook():
-    try:
-        data = request.json
-        print("--- Incoming Webhook Data ---")
-        
-        if data.get("typeWebhook") == "incomingMessageReceived":
-            sender = data.get("senderData", {}).get("chatId", "")
+    while True:
+        try:
+            # මෙතැනින් 24 පැයම මාකට් එක චෙක් කරමින් ඔටෝ ට්‍රේඩ්ස් සිදු කරයි
+            response = session.get_tickers(category="spot", symbol=symbol)
+            price = float(response['result']['list'][0]['lastPrice'])
+            print(f"[Auto Trade] Current {symbol} Price: {price}")
             
-            # වෙනත් අංක වලින් එන මැසේජ් මඟ හරියි (ඔයාගේ අංකයෙන් එන ඒවාට පමණක් ක්‍රියා කරයි)
-            if MY_WHATSAPP_NUMBER not in sender:
-                print(f"Ignored message from unauthorized user: {sender}")
-                return "OK", 200
+            # පරතරය (උදාහරණයක් ලෙස පැයකට වරක්)
+            time.sleep(3600)
+            
+        except Exception as e:
+            print("Auto Trading Error:", str(e))
+            time.sleep(60)
 
-            message_data = data.get("messageData", {})
-            message_text = ""
-            if message_data.get("typeMessage") == "textMessage":
-                message_text = message_data.get("textMessageData", {}).get("textMessage", "")
-            elif message_data.get("typeMessage") == "extendedTextMessage":
-                message_text = message_data.get("extendedTextMessageData", {}).get("text", "")
+# --- 2. WhatsApp එකෙන් ඔයා අහන ප්‍රශ්න වලට ඔයාගේ නම්බර් එකට පමණක් උත්තර දෙන කොටස ---
+@app.route("/")
+def home():
+    return "Bybit 24/7 Auto Trading & Secure WhatsApp Bot is Running!"
 
-            print(f"Sender (Authorized): {sender}, Message: {message_text}")
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json
+    
+    try:
+        # මැසේජ් එක එවපු කෙනාගේ නම්බර් එක ලබා ගැනීම
+        sender_number = data.get("from") or data.get("sender", {}).get("phone") or data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [{}])[0].get("from")
+        
+        print(f"Incoming message from: {sender_number}")
+        
+        # **ප්‍රධාන පිරික්සුම:** එන නම්බර් එක ඔයාගේ නම්බර් එක (`966572686730`) නොවේ නම්, සම්පූර්ණයෙන්ම නොසලකා හරියි (Ignore)
+        if sender_number != MY_PHONE_NUMBER:
+            print("Unauthorized sender. Ignored.")
+            return {"status": "ignored", "message": "Not authorized number"}, 200
 
-            if sender and message_text:
-                ai_reply = "සමාවෙන්න, මට දැන් උත්තර දෙන්න බැහැ."
-                text_lower = message_text.lower()
-                
-                if "start trading" in text_lower or "ට්‍රේඩ් කරන්න" in text_lower or "trade" in text_lower:
-                    ai_reply = execute_auto_trade()
-                elif "profit" in text_lower or "ප්‍රොෆිට්" in text_lower or "balance" in text_lower or "ලාභය" in text_lower or "salli" in text_lower:
-                    ai_reply = get_binance_account_balance()
-                else:
-                    if client:
-                        try:
-                            system_prompt = "You are an expert automated crypto trading bot manager. Answer user queries clearly."
-                            completion = client.chat.completions.create(
-                                model="llama-3.3-70b-versatile",
-                                messages=[
-                                    {"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": message_text}
-                                ],
-                                temperature=0.7,
-                            )
-                            ai_reply = completion.choices[0].message.content
-                        except Exception as e:
-                            ai_reply = f"දෝෂයක් සිදු විය: {str(e)}"
+        # මැසේජ් එක කියවීම
+        message_text = data.get("text", {}).get("body", "").lower() or data.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [{}])[0].get("text", {}).get("body", "").lower()
+        
+        print(f"Message from you: {message_text}")
 
-                url = f"https://api.green-api.com/waInstance{GREEN_API_ID_INSTANCE}/sendMessage/{GREEN_API_TOKEN}"
-                payload = {
-                    "chatId": sender,
-                    "message": ai_reply
-                }
-                headers = {'Content-Type': 'application/json'}
-                resp = requests.post(url, json=payload, headers=headers)
-                print(f"Green API Send Response: {resp.status_code} - {resp.text}")
+        # ඔයා අහන ප්‍රශ්න වලට දෙන උත්තර (Commands)
+        reply_message = ""
+        if "balance" in message_text or "ශේෂය" in message_text:
+            wallet = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+            balance = wallet['result']['list'][0]['coin'][0]['walletBalance']
+            reply_message = f"Your current USDT balance is: {balance}"
+            
+        elif "status" in message_text:
+            reply_message = "Bot is running 24/7 and trading automatically for you!"
+            
+        else:
+            reply_message = f"Command received! Bot is active. You said: {message_text}"
 
-        return "OK", 200
+        print(f"Replying only to your number ({MY_PHONE_NUMBER}): {reply_message}")
+        return {"status": "success", "reply": reply_message}, 200
+        
     except Exception as e:
-        print(f"Webhook Main Error: {e}")
-        return "OK", 200
+        print("Webhook Error:", str(e))
+        return {"status": "error", "message": str(e)}, 400
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # 24/7 ඔටෝ ට්‍රේඩිං ස්ටාර්ට් කිරීම
+    t = threading.Thread(target=auto_trading_worker)
+    t.daemon = True
+    t.start()
+    
+    # සර්වර් එක ක්‍රියාත්මක කිරීම
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
