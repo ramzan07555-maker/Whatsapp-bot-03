@@ -4,13 +4,13 @@ from flask import Flask, request
 
 app = Flask(__name__)
 
-ID_INSTANCE = os.getenv("PHONE_NUMBER_ID", "YOUR_INSTANCE_ID")
-API_TOKEN = os.getenv("WHATSAPP_TOKEN", "YOUR_API_TOKEN")
+ID_INSTANCE = os.getenv("PHONE_NUMBER_ID", "710722695539")
+API_TOKEN = os.getenv("WHATSAPP_TOKEN", "5dcefdf92a5d46b69f4cd24d720a00fa5430a653a7be4d3687")
 
 def send_whatsapp_message(chat_id, message_text):
     """Green API හරහා නිවැරදිව මැසේජ් යැවීම"""
     try:
-        # නිවැරදි Green API URL එක
+        # Green API නිවැරදි Endpoints ෆෝමැට් එක
         url = f"https://7107.api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
         
         payload = {
@@ -19,6 +19,7 @@ def send_whatsapp_message(chat_id, message_text):
         }
         
         response = requests.post(url, json=payload)
+        print("Send response status:", response.status_code)
         print("Send response text:", response.text)
         return response.json()
     except Exception as e:
