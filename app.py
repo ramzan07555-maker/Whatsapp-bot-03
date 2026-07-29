@@ -1,20 +1,17 @@
 import os
 import requests
 from flask import Flask, request
-from pybit.unified_trading import HTTP
+import hmac
+import hashlib
+import base64
+import time
 
 app = Flask(__name__)
 
-# Render Environment Variables වලින් API Key සහ Secret ලබා ගැනීම
-API_KEY = os.getenv("BYBIT_API_KEY")
-API_SECRET = os.getenv("BYBIT_API_SECRET")
-
-# Bybit HTTP session එක සැකසීම (Live trading සඳහා testnet=False)
-session = HTTP(
-    testnet=False,
-    api_key=API_KEY,
-    api_secret=API_SECRET
-)
+# Render Environment Variables වලින් KuCoin විස්තර ලබා ගැනීම
+API_KEY = os.getenv("KUCOIN_API_KEY")
+API_SECRET = os.getenv("KUCOIN_API_SECRET")
+API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE")
 
 ID_INSTANCE = "710722695539"
 API_TOKEN = "5dcefdf92a5d46b69f4cd24d720a00fa5430a653a7be4d3687"
@@ -33,32 +30,33 @@ def send_whatsapp_message(chat_id, message_text):
         print(f"Error sending message: {e}")
         return None
 
-def get_bybit_grid_status(symbol="BTCUSDT"):
-    """Bybit API එක හරහා ලයිව් මාකට් ප්‍රයිස් එක ලබාගෙන ග්‍රිඩ් තත්ත්වය පරීක්ෂා කිරීම"""
+def get_kucoin_market_price(symbol="BTC-USDT"):
+    """KuCoin Public API එක හරහා ලයිව් මාකට් ප්‍රයිස් එක ලබා ගැනීම (කිසිදු IP බ්ලොක් කිරීමක් නැත)"""
     try:
-        response = session.get_tickers(
-            category="spot",
-            symbol=symbol
-        )
-        list_data = response.get("result", {}).get("list", [])
-        if list_data:
-            current_price = float(list_data[0].get("lastPrice"))
+        url = f"https://api.kucoin.com/api/v1/market/orderbook/level1?symbol={symbol}"
+        response = requests.get(url)
+        data = response.json()
+        
+        if data.get("code") == "200000":
+            price_data = data.get("data", {})
+            current_price = float(price_data.get("price"))
+            
             buy_price = round(current_price * 0.99, 2)
             sell_price = round(current_price * 1.01, 2)
             
             msg = (
-                f"🤖 *Bybit Grid Bot Status* ({symbol}):\n\n"
+                f"🤖 *KuCoin Spot Grid Bot Status* ({symbol}):\n\n"
                 f"📍 Current Market Price: ${current_price}\n"
                 f"🟢 Lower Grid (Buy Zone): ${buy_price}\n"
                 f"🔴 Upper Grid (Sell Zone): ${sell_price}\n"
-                f"✨ Status: Connected to Bybit successfully!"
+                f"✨ Status: Connected to KuCoin successfully!"
             )
             return msg
         else:
-            return f"Could not fetch market price for {symbol} from Bybit."
+            return f"Could not fetch market price for {symbol} from KuCoin."
     except Exception as e:
-        print(f"Bybit API Error: {e}")
-        return f"Bybit Error: {str(e)}"
+        print(f"KuCoin API Error: {e}")
+        return f"KuCoin Error: {str(e)}"
 
 @app.route('/', methods=['POST'])
 @app.route('/webhook', methods=['POST'])
@@ -78,15 +76,15 @@ def webhook():
                 print(f"Message from {chat_id}: {msg_body}")
                 
                 # බොට් යවන මැසේජ් වලට නැවත රිප්ලයි වීම වැළැක්වීම
-                if "bybit grid bot status" in msg_body:
+                if "kucoin spot grid bot status" in msg_body:
                     return "OK", 200
 
                 if "grid" in msg_body or "start" in msg_body or "btc" in msg_body:
-                    reply_text = get_bybit_grid_status("BTCUSDT")
+                    reply_text = get_kucoin_market_price("BTC-USDT")
                 elif "hi" in msg_body or "hello" in msg_body:
-                    reply_text = "Hello! Send 'grid' to check your Bybit automated trading status."
+                    reply_text = "Hello! Send 'grid' to check your KuCoin automated trading status."
                 else:
-                    reply_text = f"Received: '{msg_body}'. Send 'grid' to view the Bybit strategy."
+                    reply_text = f"Received: '{msg_body}'. Send 'grid' to view the KuCoin strategy."
                 
                 send_whatsapp_message(chat_id, reply_text)
                 
