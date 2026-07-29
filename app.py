@@ -1,15 +1,15 @@
 import os
 from flask import Flask, request
-import google.generativeai as genai
+from google import genai
 import requests
 
 app = Flask(__name__)
 
-# Gemini API සකස් කරගැනීම
+# අලුත් Google GenAI ਕී එක සකස් කරගැනීම
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Green API විස්තර
 GREEN_API_ID_INSTANCE = os.environ.get("GREEN_API_ID_INSTANCE")
@@ -23,26 +23,26 @@ def home():
 def webhook():
     try:
         data = request.json
-        print("Received Data:", data)  # Render Logs වල දත්ත බලාගැනීමට
         
-        # Green API එකෙන් එන මැසේජ් එක පරීක්ෂා කිරීම
         if data.get("typeWebhook") == "incomingMessageReceived":
             sender = data.get("senderData", {}).get("chatId", "")
             message_data = data.get("messageData", {})
             
-            # ටෙක්ස්ට් මැසේජ් එකක් පමණක් ලබා ගැනීම
             message_text = ""
             if message_data.get("typeMessage") == "textMessage":
                 message_text = message_data.get("textMessageData", {}).get("textMessage", "")
             elif message_data.get("typeMessage") == "extendedTextMessage":
                 message_text = message_data.get("extendedTextMessageData", {}).get("text", "")
 
-            # අංක බැලීමකින් තොරව මැසේජ් එකක් ආපු ගමන් රිප්ලයි යැවීම
             if sender and message_text:
                 ai_reply = "සමාවෙන්න, මට දැන් AI එකට සම්බන්ධ වෙන්න බැහැ."
-                if GEMINI_API_KEY:
+                if client:
                     try:
-                        response = model.generate_content(message_text)
+                        # අලුත් ක්‍රමයට Gemini 2.5 හෝ Flash ආධාරයෙන් රිප්ලයි ලබා ගැනීම
+                        response = client.models.generate_content(
+                            model="gemini-2.5-flash",
+                            contents=message_text,
+                        )
                         ai_reply = response.text
                     except Exception as e:
                         ai_reply = f"දෝෂයක් සිදු විය: {str(e)}"
@@ -54,8 +54,7 @@ def webhook():
                     "message": ai_reply
                 }
                 headers = {'Content-Type': 'application/json'}
-                response = requests.post(url, json=payload, headers=headers)
-                print("Green API Response:", response.text)
+                requests.post(url, json=payload, headers=headers)
 
         return "OK", 200
     except Exception as e:
