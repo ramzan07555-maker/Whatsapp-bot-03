@@ -5,6 +5,7 @@ import hmac
 import hashlib
 import base64
 import time
+import threading
 from groq import Groq
 
 app = Flask(__name__)
@@ -79,6 +80,46 @@ def get_market_and_balances():
         print(f"Data Fetch Error: {e}")
         return 0.0, 0.0, 0.0
 
+def place_kucoin_order(side, amount_usdt=10):
+    """KuCoin එකේ සැබෑ ලෙසම Market Order එකක් (BUY හෝ SELL) ක්‍රියාත්මක කිරීම"""
+    try:
+        endpoint = "/api/v1/orders"
+        client_oid = str(int(time.time() * 1000))
+        
+        # මිලදී ගැනීමේදී හෝ විකිණීමේදී අවශ්‍ය පරාමිතීන් සකස් කිරීම
+        # (මෙහිදී ආරක්ෂාවට අවම ප්‍රමාණයක් හෝ පවතින ශේෂය පදනම් කරගනී)
+        body_dict = {
+            "clientOid": client_oid,
+            "side": side.lower(), # 'buy' හෝ 'sell'
+            "symbol": "BTC-USDT",
+            "type": "market"
+        }
+        
+        if side.lower() == 'buy':
+            body_dict["funds"] = str(amount_usdt) # බයි කිරීමට පාවිච්චි කරන USDT ප්‍රමාණය
+        else:
+            # BTC විකිණීමේදී (උදාහරණයක් ලෙස සතුව ඇති මුළු ප්‍රමාණයම හෝ කොටසක්)
+            _, _, btc_bal = get_market_and_balances()
+            if btc_bal < 0.0001:
+                return "Not enough BTC to sell."
+            body_dict["size"] = str(btc_bal)
+
+        import json
+        body_str = json.dumps(body_dict)
+        headers = get_kucoin_signature(endpoint, "POST", body_str)
+        if not headers:
+            return "Failed to generate API signature."
+
+        response = requests.post(f"https://api.kucoin.com{endpoint}", headers=headers, data=body_str)
+        res_data = response.json()
+        
+        if res_data.get("code") == "200000":
+            return f"Success! Order ID: {res_data.get('data', {}).get('orderId')}"
+        else:
+            return f"Order Failed: {res_data.get('msg', 'Unknown error')}"
+    except Exception as e:
+        return f"Order Execution Error: {str(e)}"
+
 def evaluate_ai_trading_decision(price, usdt, btc):
     """Groq AI හරහා අවදානම පාලනය කරමින් ස්වයංක්‍රීයව Buy/Sell තීරණ ගැනීම"""
     if not groq_client:
@@ -109,16 +150,44 @@ def execute_auto_trade_logic():
         return "Failed to fetch market data."
     
     # AI තීරණය ලබා ගැනීම
-    ai_decision = evaluate_ai_trading_decision(price, usdt, btc)
+    ai_decision_full = evaluate_ai_trading_decision(price, usdt, btc)
     
+    # AI ප්‍රතිඵලයෙන් පළමු වචනය (BUY, SELL, HOLD) පමණක් වෙන් කර ගැනීම
+    decision_word = ai_decision_full.split()[0].upper() if ai_decision_full else "HOLD"
+    
+    trade_result_msg = ""
+    if "BUY" in decision_word and usdt >= 5:
+        # USDT ප්‍රමාණවත් නම් ස්වයංක්‍රීයව BUY කිරීම (උදාහරණයක් ලෙස ඩොලර් 10 බැගින්)
+        trade_result_msg = place_kucoin_order("buy", amount_usdt=10)
+    elif "SELL" in decision_word and btc > 0.0001:
+        # BTC ප්‍රමාණවත් නම් ස්වයංක්‍රීයව SELL කිරීම
+        trade_result_msg = place_kucoin_order("sell")
+    else:
+        trade_result_msg = "No trade executed (HOLD or Insufficient Balance)."
+
     report = (
         f"🤖 *Fully Auto-Trading Bot Report*:\n\n"
         f"📈 BTC Price: ${price}\n"
         f"💵 USDT: {usdt} | 🪙 BTC: {btc}\n\n"
-        f"🧠 *AI & Risk Strategy Decision*:\n{ai_decision}\n\n"
-        f"🛡️ (Risk Control: Active & Safe Mode)"
+        f"🧠 *AI Decision*:\n{ai_decision_full}\n\n"
+        f"⚡ *Execution Status*:\n{trade_result_msg}\n\n"
+        f"🛡️ (24/7 Fully Automated Mode)"
     )
     return report
+
+def background_trading_loop():
+    """24 පැයම ක්‍රියාත්මක වෙමින් ස්වයංක්‍රීයව මාකට් එක නිරීක්ෂණය කරන ලූප් එක"""
+    while True:
+        try:
+            # උදාහරණයක් ලෙස සෑම මිනිත්තු 15 කට වතාවක් ඔටෝ ට්‍රේඩ් ලොජික් එක ක්‍රියාත්මක වේ
+            report = execute_auto_trade_logic()
+            # අවශ්‍ය නම් ස්වයංක්‍රීයව WhatsApp වෙත ද මෙහිදී වාර්තා යැවිය හැක:
+            # send_whatsapp_message(MY_PHONE_CHAT_ID, report)
+        except Exception as e:
+            print(f"Background Loop Error: {e}")
+        
+        # විනාඩි 15 ක διάστημα (Interval) එකක් ලබා දීම (තත්පර වලින්)
+        time.sleep(900)
 
 @app.route('/', methods=['POST'])
 @app.route('/webhook', methods=['POST'])
@@ -160,4 +229,8 @@ def webhook():
     return "OK", 200
 
 if __name__ == "__main__":
+    # සර්වර් එක පටන් ගන්නා විටම 24/7 background loop එක වෙනම Thread එකක් ලෙස ආරම්භ කිරීම
+    t = threading.Thread(target=background_trading_loop, daemon=True)
+    t.start()
+    
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
