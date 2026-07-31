@@ -1142,8 +1142,15 @@ def secure_webhook(secret_token):
     
     try:
         if "messageData" in data:
-            chat_id = data.get("senderData", {}).get("chatId", "")
-            if chat_id != MY_PHONE_CHAT_ID:
+            sender_data = data.get("senderData", {})
+            chat_id = sender_data.get("chatId", "")
+            
+            if not chat_id:
+                chat_id = data.get("chatId", "")
+            
+            logging.info(f"Extracted Chat ID: {chat_id} | Expected: {MY_PHONE_CHAT_ID}")
+
+            if MY_PHONE_CHAT_ID not in chat_id:
                 return "OK", 200
 
             msg_data = data.get("messageData", {})
