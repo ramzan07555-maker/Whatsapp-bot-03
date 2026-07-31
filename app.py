@@ -41,7 +41,10 @@ if not WEBHOOK_SECRET:
 
 ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
 API_TOKEN = os.getenv("GREEN_API_TOKEN")
-MY_PHONE_CHAT_ID = os.getenv("MY_PHONE_CHAT_ID")
+
+# ඔබ ලබා දුන් අංකය හරියටම මෙහි යොදා ඇත
+MY_PHONE_CHAT_ID = "966572686730@c.us"
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 if not all([API_KEY, API_SECRET, API_PASSPHRASE, ID_INSTANCE, API_TOKEN, MY_PHONE_CHAT_ID]):
@@ -820,7 +823,7 @@ def generate_signal():
     macd_bearish_crossover = (prev_macd >= prev_signal) and (curr_macd < curr_signal)
 
     trend_up = (c15[-1] > ema_trend_15m) and (c1h[-1] > ema_trend_1h)
-    trend_down = (c15[-1] < ema_trend_15m) and (c1h[-1] < ema_trend_1h)
+    trend_down = (c15[-1] < ema_trend_15m) and (c1h[-1] < ema_trend_1H_PERIOD if 'EMA_TREND_1H_PERIOD' in globals() else c1h[-1] < ema_trend_1h)
 
     adx_ok = adx > ADX_THRESHOLD
     rsi_buy_ok = (RSI_LOWER <= rsi <= RSI_UPPER)
@@ -1135,7 +1138,6 @@ def secure_webhook(secret_token):
 
     data = request.json or {}
     
-    # මෙම පේළිය හරහා Green API එකෙන් එන මුළු දත්ත එකතුවම Render Logs වල දිස්වේ:
     logging.info(f"RECEIVED WEBHOOK DATA: {json.dumps(data, indent=2)}")
     
     try:
