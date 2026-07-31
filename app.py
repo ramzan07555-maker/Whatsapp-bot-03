@@ -32,20 +32,28 @@ logging.basicConfig(
 app = Flask(__name__)
 
 # --- 2. ENVIRONMENT VARIABLES & SECRETS ---
-API_KEY = os.getenv("KUCOIN_API_KEY")
-API_SECRET = os.getenv("KUCOIN_API_SECRET")
-API_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# .strip() on every secret: copy-pasting from a console/browser easily picks up a
+# trailing newline or space, which silently breaks URLs/signatures (this caused a
+# 404 then a 401 in production before the cause was found). Stripping here means
+# a stray whitespace character in an env var can never break auth again.
+def _clean_env(name):
+    val = os.getenv(name)
+    return val.strip() if val else val
+
+API_KEY = _clean_env("KUCOIN_API_KEY")
+API_SECRET = _clean_env("KUCOIN_API_SECRET")
+API_PASSPHRASE = _clean_env("KUCOIN_PASSPHRASE")
+WEBHOOK_SECRET = _clean_env("WEBHOOK_SECRET")
 if not WEBHOOK_SECRET:
     raise RuntimeError("Critical Security Error: WEBHOOK_SECRET environment variable is missing.")
 
-ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE")
-API_TOKEN = os.getenv("GREEN_API_TOKEN")
+ID_INSTANCE = _clean_env("GREEN_API_ID_INSTANCE")
+API_TOKEN = _clean_env("GREEN_API_TOKEN")
 
 # ඔබ ලබා දුන් අංකය හරියටම මෙහි යොදා ඇත
 MY_PHONE_CHAT_ID = "966572686730@c.us"
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = _clean_env("GROQ_API_KEY")
 
 if not all([API_KEY, API_SECRET, API_PASSPHRASE, ID_INSTANCE, API_TOKEN, MY_PHONE_CHAT_ID]):
     raise RuntimeError("Missing required environment variables. Please check your config/environment settings.")
