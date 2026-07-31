@@ -98,7 +98,8 @@ def whatsapp_worker():
                 break
             message_text, chat_id = task
             target_chat = chat_id or MY_PHONE_CHAT_ID
-            url = f"https://api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
+            # නිවැරදි කළ Green API URL එක මෙහි යොදා ඇත
+            url = f"https://7107.api.green-api.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
             payload = {"chatId": target_chat, "message": message_text}
 
             backoff = 2
