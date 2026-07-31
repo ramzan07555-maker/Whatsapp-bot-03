@@ -121,7 +121,7 @@ def send_whatsapp_message(message_text, chat_id=None):
     backoff = 2
     for attempt in range(4):
         try:
-            res = requests.post(url, data=json.dumps(payload), timeout=10)
+            res = requests.post(url, json=payload, timeout=10)
             if res.status_code in [200, 201]:
                 logging.info(f"WhatsApp send OK to {target_chat}: {message_text[:40]!r} -> {res.status_code} {res.text[:200]}")
                 return True
