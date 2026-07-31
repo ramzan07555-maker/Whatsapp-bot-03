@@ -94,10 +94,21 @@ background_thread_ref = None
 # logged a success line either, so failures were invisible. All current callers
 # (AI reply thread, run_cycle thread, shutdown handler) already run off the main
 # webhook thread, so sending directly here does not block webhook responses.
+_url_logged_once = {"done": False}
+
 def send_whatsapp_message(message_text, chat_id=None):
     target_chat = chat_id or MY_PHONE_CHAT_ID
     url = f"https://7107.api.greenapi.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
     payload = {"chatId": target_chat, "message": message_text}
+
+    if not _url_logged_once["done"]:
+        masked_token = (API_TOKEN[:4] + "..." + API_TOKEN[-4:]) if API_TOKEN and len(API_TOKEN) > 8 else "MISSING_OR_SHORT"
+        logging.info(
+            f"WhatsApp URL diag: ID_INSTANCE={ID_INSTANCE!r} (len={len(ID_INSTANCE) if ID_INSTANCE else 0}), "
+            f"API_TOKEN masked={masked_token} (len={len(API_TOKEN) if API_TOKEN else 0}), "
+            f"full_url_masked=https://7107.api.greenapi.com/waInstance{ID_INSTANCE!r}/sendMessage/{masked_token}"
+        )
+        _url_logged_once["done"] = True
 
     backoff = 2
     for attempt in range(4):
