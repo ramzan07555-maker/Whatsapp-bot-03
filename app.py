@@ -1,1207 +1,524 @@
-import os
-import time
+import base64
+import csv
+import hashlib
+import hmac
 import json
-import sqlite3
-import threading
 import logging
-import requests
+import os
 import signal
 import sys
-import csv
-from datetime import datetime, timezone
-from queue import Queue
-from flask import Flask, request, abort
-import hmac
-import hashlib
-import base64
+import threading
+import time
 
-# --- 1. LOGGING CONFIGURATION ---
-LOG_DIR = os.getenv("DATA_DIR", os.path.dirname(__file__))
-os.makedirs(LOG_DIR, exist_ok=True)
-ERROR_LOG_FILE = os.path.join(LOG_DIR, "error_trades.log")
+import requests
+from flask import Flask, abort, request
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(ERROR_LOG_FILE, encoding='utf-8')
-    ]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 app = Flask(__name__)
 
-# --- 2. ENVIRONMENT VARIABLES & SECRETS ---
-# .strip() on every secret: copy-pasting from a console/browser easily picks up a
-# trailing newline or space, which silently breaks URLs/signatures (this caused a
-# 404 then a 401 in production before the cause was found). Stripping here means
-# a stray whitespace character in an env var can never break auth again.
-def _clean_env(name):
-    val = os.getenv(name)
+
+# --- ENVIRONMENT VARIABLES (stripped — avoids the newline/whitespace bugs we hit before) ---
+def _clean_env(name, default=None):
+    val = os.getenv(name, default)
     return val.strip() if val else val
+
 
 API_KEY = _clean_env("KUCOIN_API_KEY")
 API_SECRET = _clean_env("KUCOIN_API_SECRET")
 API_PASSPHRASE = _clean_env("KUCOIN_PASSPHRASE")
 WEBHOOK_SECRET = _clean_env("WEBHOOK_SECRET")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("Critical Security Error: WEBHOOK_SECRET environment variable is missing.")
-
 ID_INSTANCE = _clean_env("GREEN_API_ID_INSTANCE")
 API_TOKEN = _clean_env("GREEN_API_TOKEN")
-
-# ඔබ ලබා දුන් අංකය හරියටම මෙහි යොදා ඇත
-MY_PHONE_CHAT_ID = "966572686730@c.us"
-
+MY_PHONE_CHAT_ID = _clean_env("MY_PHONE_CHAT_ID")
 GROQ_API_KEY = _clean_env("GROQ_API_KEY")
 
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET environment variable is required.")
 if not all([API_KEY, API_SECRET, API_PASSPHRASE, ID_INSTANCE, API_TOKEN, MY_PHONE_CHAT_ID]):
-    raise RuntimeError("Missing required environment variables. Please check your config/environment settings.")
+    raise RuntimeError("Missing required environment variables — check KuCoin and Green API config.")
 
-# --- 3. STRATEGY, RISK & FEATURE PARAMETERS ---
-MA_SHORT = 9
-MA_LONG = 21
-EMA_TREND_PERIOD = 200
-EMA_TREND_1H_PERIOD = 50
-ADX_PERIOD = 14
-ADX_THRESHOLD = 25.0
-ATR_PERIOD = 14
-RSI_PERIOD = 14
-RSI_LOWER = 40
-RSI_UPPER = 65
-
-RISK_PER_TRADE_PCT = 0.02
-MAX_SLIPPAGE_PCT = 0.01
-MAX_POSITION_PCT_CAP = 0.20
-ATR_SL_MULTIPLIER = 1.5
-ATR_TP1_MULTIPLIER = 1.5
-ATR_TP2_MULTIPLIER = 3.0
-MAX_DAILY_LOSS_PCT = 0.05
-MAX_TRADES_PER_DAY = 3
-COOLDOWN_SECONDS = 1800
-MIN_TRADE_USDT = 5
-LOOP_INTERVAL_SECONDS = 900
+# --- STRATEGY / RISK PARAMETERS ---
+PROFIT_TARGET_PCT = float(_clean_env("PROFIT_TARGET_PCT", "0.5")) / 100.0
+STOP_LOSS_PCT = float(_clean_env("STOP_LOSS_PCT", "5")) / 100.0
+LOOP_INTERVAL_SECONDS = int(_clean_env("LOOP_INTERVAL_SECONDS", "60"))  # every minute default
+MIN_TRADE_USDT = float(_clean_env("MIN_TRADE_USDT", "1"))
 FEE_RATE = 0.001
 
-MAX_ALLOWED_SPREAD_PCT = 0.0015
-MIN_ORDERBOOK_DEPTH_USDT = 50000
+SYMBOL = "BTC-USDT"
+BASE_URL = "https://api.kucoin.com"
 
-DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(__file__))
-DB_FILE = os.path.join(DATA_DIR, "bot_database.db")
-CSV_JOURNAL_FILE = os.path.join(DATA_DIR, "trade_journal.csv")
-EQUITY_CURVE_FILE = os.path.join(DATA_DIR, "equity_curve.csv")
+DATA_DIR = _clean_env("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(DATA_DIR, exist_ok=True)
+STATE_FILE = os.path.join(DATA_DIR, "flex_state.json")
+TRADE_LOG_FILE = os.path.join(DATA_DIR, "flex_trade_log.csv")
 
 trading_lock = threading.Lock()
 shutdown_flag = threading.Event()
 background_thread_ref = None
 
-# --- WHATSAPP SEND (direct, synchronous — logs both success and failure) ---
-# Previously this used an in-memory Queue + background worker thread. On Render's
-# free tier the process can restart due to inactivity spin-down; a message sitting
-# in that in-memory queue at restart time was silently lost, and the old code never
-# logged a success line either, so failures were invisible. All current callers
-# (AI reply thread, run_cycle thread, shutdown handler) already run off the main
-# webhook thread, so sending directly here does not block webhook responses.
-_url_logged_once = {"done": False}
-
-def send_whatsapp_message(message_text, chat_id=None):
-    target_chat = chat_id or MY_PHONE_CHAT_ID
-    url = f"https://7107.api.greenapi.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
-    payload = {"chatId": target_chat, "message": message_text}
-
-    if not _url_logged_once["done"]:
-        masked_token = (API_TOKEN[:4] + "..." + API_TOKEN[-4:]) if API_TOKEN and len(API_TOKEN) > 8 else "MISSING_OR_SHORT"
-        logging.info(
-            f"WhatsApp URL diag: ID_INSTANCE={ID_INSTANCE!r} (len={len(ID_INSTANCE) if ID_INSTANCE else 0}), "
-            f"API_TOKEN masked={masked_token} (len={len(API_TOKEN) if API_TOKEN else 0}), "
-            f"full_url_masked=https://7107.api.greenapi.com/waInstance{ID_INSTANCE!r}/sendMessage/{masked_token}"
-        )
-        _url_logged_once["done"] = True
-
-    backoff = 2
-    for attempt in range(4):
-        try:
-            res = requests.post(url, json=payload, timeout=10)
-            if res.status_code in [200, 201]:
-                logging.info(f"WhatsApp send OK to {target_chat}: {message_text[:40]!r} -> {res.status_code} {res.text[:200]}")
-                return True
-            elif res.status_code == 429:
-                wait = int(res.headers.get("Retry-After", 5))
-                logging.warning(f"WhatsApp send rate-limited (429), retrying in {wait}s")
-                time.sleep(wait)
-            else:
-                logging.error(f"WhatsApp send failed: {res.status_code} {res.text[:300]}")
-                time.sleep(backoff ** attempt)
-        except Exception as e:
-            logging.error(f"WhatsApp send exception (attempt {attempt+1}/4): {e}")
-            time.sleep(backoff ** attempt)
-
-    logging.error(f"WhatsApp message failed permanently after retries: {message_text[:60]!r}")
-    return False
+DEFAULT_STATE = {
+    "in_position": False, "entry_price": 0.0, "entry_qty": 0.0,
+    "last_buy_amount": 0.0, "total_realized_profit_usdt": 0.0, "stop_order_id": None,
+}
 
 
-# --- GROQ AI CHAT ---
-def get_ai_reply(user_message: str) -> str:
-    if not GROQ_API_KEY:
-        return "AI chat disabled. Server එකේ GROQ_API_KEY environment variable එක set කරන්න."
-
-    system_prompt = (
-        "You are a helpful assistant integrated with a KuCoin BTC-USDT trading bot. "
-        "You can speak both Sinhala and English. Always reply in the same language the user is using. "
-        "If the user writes in Sinhala, reply in Sinhala. If in English, reply in English. "
-        "You may mix both if the user mixes. Be friendly, clear and concise. "
-        "This bot uses technical indicators (SMA, EMA, MACD, RSI, ADX, ATR). "
-        "If the user wants to run a trading cycle, tell them to type: trade / status / cycle / run. "
-        "Do not give financial advice. Keep answers safe and helpful."
-    )
-
+# --- STATE ---
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return dict(DEFAULT_STATE)
     try:
-        url = "https://api.groq.com/openai/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            "temperature": 0.7,
-            "max_tokens": 1024
-        }
-        res = requests.post(url, headers=headers, json=payload, timeout=30)
-        if res.status_code == 200:
-            data = res.json()
-            return data["choices"][0]["message"]["content"].strip()
-        else:
-            logging.error(f"Groq API error: {res.status_code} - {res.text[:200]}")
-            return "සමාවෙන්න, දැන් AI එකට reply කරන්න බැරි වුණා. / Sorry, AI is temporarily unavailable."
-    except Exception as e:
-        logging.error(f"Groq request failed: {e}")
-        return "සමාවෙන්න, දෝෂයක් ආවා. / Sorry, something went wrong."
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        logging.warning("State file unreadable, starting fresh.")
+        return dict(DEFAULT_STATE)
 
-# --- 4. PERSISTENT STORAGE ---
-def init_db():
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL;")
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            ''')
-
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS trade_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT,
-                    action TEXT,
-                    price REAL,
-                    size_or_amount REAL,
-                    reason TEXT,
-                    order_id TEXT
-                )
-            ''')
-            conn.commit()
-
-            cursor.execute("SELECT value FROM bot_state WHERE key = 'state_json'")
-            row = cursor.fetchone()
-            default_state = {
-                "in_position": False,
-                "entry_price": 0.0,
-                "position_size": 0.0,
-                "initial_position_size": 0.0,
-                "dynamic_sl": 0.0,
-                "dynamic_tp": 0.0,
-                "tp1_hit": False,
-                "highest_price_since_entry": 0.0,
-                "break_even_activated": False,
-                "day_realized_pnl": 0.0,
-                "starting_equity_today": 0.0,
-                "trading_halted_today": False,
-                "trades_today_count": 0,
-                "last_trade_time": 0.0,
-                "last_candle_timestamp": 0,
-                "last_reset_date": time.strftime("%Y-%m-%d"),
-                "last_heartbeat_time": 0.0,
-                "last_news_check_date": "",
-                "cached_news_events": []
-            }
-
-            if not row:
-                cursor.execute("INSERT INTO bot_state (key, value) VALUES ('state_json', ?)", (json.dumps(default_state),))
-                conn.commit()
-            else:
-                existing_state = json.loads(row[0])
-                if "cached_news_events" not in existing_state:
-                    existing_state["cached_news_events"] = []
-                    cursor.execute("REPLACE INTO bot_state (key, value) VALUES ('state_json', ?)", (json.dumps(existing_state),))
-                    conn.commit()
-    except Exception as e:
-        logging.exception(f"Database initialization failed: {e}")
-
-init_db()
-
-def get_state():
-    try:
-        with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM bot_state WHERE key = 'state_json'")
-            row = cursor.fetchone()
-            if row:
-                return json.loads(row[0])
-    except Exception as e:
-        logging.exception(f"Failed to retrieve state from DB: {e}")
-    return {
-        "in_position": False, "entry_price": 0.0, "position_size": 0.0,
-        "initial_position_size": 0.0, "dynamic_sl": 0.0, "dynamic_tp": 0.0,
-        "tp1_hit": False, "highest_price_since_entry": 0.0, "break_even_activated": False,
-        "day_realized_pnl": 0.0, "starting_equity_today": 0.0, "trading_halted_today": False,
-        "trades_today_count": 0, "last_trade_time": 0.0, "last_candle_timestamp": 0,
-        "last_reset_date": time.strftime("%Y-%m-%d"), "last_heartbeat_time": 0.0,
-        "last_news_check_date": "", "cached_news_events": []
-    }
 
 def save_state(state):
-    try:
-        with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
-            cursor = conn.cursor()
-            cursor.execute("REPLACE INTO bot_state (key, value) VALUES ('state_json', ?)", (json.dumps(state),))
-            conn.commit()
-    except Exception as e:
-        logging.exception(f"Failed to save state to DB: {e}")
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
-def log_trade(action, price, size_or_amount, reason, order_id):
-    try:
-        with sqlite3.connect(DB_FILE, timeout=30.0) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO trade_logs (timestamp, action, price, size_or_amount, reason, order_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (time.strftime("%Y-%m-%d %H:%M:%S"), action, price, size_or_amount, reason, order_id)
-            )
-            conn.commit()
 
-        file_exists = os.path.isfile(CSV_JOURNAL_FILE)
-        with open(CSV_JOURNAL_FILE, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["Timestamp", "Action", "Price", "SizeOrAmount", "Reason", "OrderID"])
-            writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), action, price, size_or_amount, reason, order_id])
-    except Exception as e:
-        logging.exception(f"Failed to write trade log: {e}")
+# --- KUCOIN API ---
+def _kucoin_headers(endpoint, method, body=""):
+    ts = str(int(time.time() * 1000))
+    str_to_sign = ts + method.upper() + endpoint + body
+    signature = base64.b64encode(hmac.new(API_SECRET.encode(), str_to_sign.encode(), hashlib.sha256).digest()).decode()
+    passphrase = base64.b64encode(hmac.new(API_SECRET.encode(), API_PASSPHRASE.encode(), hashlib.sha256).digest()).decode()
+    return {
+        "KC-API-KEY": API_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase, "KC-API-KEY-VERSION": "2", "Content-Type": "application/json",
+    }
 
-def log_equity_curve(equity):
-    try:
-        file_exists = os.path.isfile(EQUITY_CURVE_FILE)
-        with open(EQUITY_CURVE_FILE, mode='a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(["Timestamp", "TotalEquity"])
-            writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), equity])
-    except Exception as e:
-        logging.exception(f"Failed to log equity curve: {e}")
-
-def check_daily_reset(current_equity):
-    state = get_state()
-    today = time.strftime("%Y-%m-%d")
-    if state.get("last_reset_date") != today:
-        state["day_realized_pnl"] = 0.0
-        state["trading_halted_today"] = False
-        state["trades_today_count"] = 0
-        state["starting_equity_today"] = current_equity
-        state["last_reset_date"] = today
-        save_state(state)
-    elif state.get("starting_equity_today", 0.0) == 0.0:
-        state["starting_equity_today"] = current_equity
-        save_state(state)
-
-def check_daily_loss_limit(equity):
-    state = get_state()
-    check_daily_reset(equity)
-    if state.get("trading_halted_today", False):
-        return True
-    starting_equity = state.get("starting_equity_today", equity)
-    max_loss_allowed = starting_equity * MAX_DAILY_LOSS_PCT
-    if state.get("day_realized_pnl", 0.0) <= -max_loss_allowed:
-        state["trading_halted_today"] = True
-        save_state(state)
-        return True
-    return False
-
-# --- 5. NEWS FILTER & LIQUIDITY CHECK (FAIL-CLOSED) ---
-def fetch_economic_calendar_events():
-    state = get_state()
-    today_str = time.strftime("%Y-%m-%d")
-    if state.get("last_news_check_date") == today_str and state.get("cached_news_events"):
-        return state.get("cached_news_events", [])
-
-    events = []
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        res = requests.get(url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            for item in data:
-                impact = item.get("impact", "")
-                title = item.get("title", "").lower()
-                date_str = item.get("date", "")
-                if impact == "High" and any(k in title for k in ["fomc", "cpi", "non-farm", "ppi", "rate decision", "fed"]):
-                    events.append(date_str)
-            state["cached_news_events"] = events
-            state["last_news_check_date"] = today_str
-            save_state(state)
-            return events
-        else:
-            return None
-    except Exception as e:
-        logging.error(f"Failed to fetch economic calendar: {e}")
-        return None
-
-def is_news_time_restricted():
-    try:
-        events = fetch_economic_calendar_events()
-        if events is None:
-            logging.warning("News API failed. Failing closed (pausing trading).")
-            return True
-
-        now_utc = datetime.now(timezone.utc)
-        for event_date_str in events:
-            try:
-                event_time = datetime.fromisoformat(event_date_str.replace("Z", "+00:00"))
-                time_diff_minutes = (now_utc - event_time).total_seconds() / 60.0
-                if -30 <= time_diff_minutes <= 30:
-                    return True
-            except Exception:
-                continue
-        return False
-    except Exception as e:
-        logging.error(f"News filter evaluation error: {e}")
-        return True
-
-def check_market_liquidity_and_spread():
-    try:
-        url = "https://api.kucoin.com/api/v1/market/orderbook/level2_20?symbol=BTC-USDT"
-        res = requests.get(url, timeout=5)
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
-            if not bids or not asks:
-                return False
-            best_bid = float(bids[0][0])
-            best_ask = float(asks[0][0])
-            spread_pct = (best_ask - best_bid) / best_bid
-            if spread_pct > MAX_ALLOWED_SPREAD_PCT:
-                return False
-            bid_depth = sum(float(b[0]) * float(b[1]) for b in bids[:5])
-            ask_depth = sum(float(a[0]) * float(a[1]) for a in asks[:5])
-            if bid_depth < MIN_ORDERBOOK_DEPTH_USDT or ask_depth < MIN_ORDERBOOK_DEPTH_USDT:
-                return False
-            return True
-        return False
-    except Exception as e:
-        logging.error(f"Market liquidity check error: {e}")
-        return False
-
-# --- API REQUESTS ---
-def api_request_with_retry(method, url, headers=None, data=None, max_retries=4):
-    backoff_factor = 2
-    for attempt in range(max_retries):
-        try:
-            if method.upper() == "GET":
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method.upper() == "POST":
-                response = requests.post(url, headers=headers, data=data, timeout=10)
-            else:
-                return None
-
-            if response.status_code == 429:
-                time.sleep(int(response.headers.get("Retry-After", 5)))
-                continue
-            if response.status_code >= 500:
-                time.sleep(backoff_factor ** attempt)
-                continue
-            if response.status_code in [200, 201]:
-                return response
-        except requests.exceptions.RequestException:
-            pass
-
-        if attempt < max_retries - 1:
-            time.sleep(backoff_factor ** attempt)
-    return None
-
-def get_kucoin_signature(endpoint, method, body=""):
-    try:
-        header_timestamp = str(int(time.time() * 1000))
-        str_to_sign = header_timestamp + method.upper() + endpoint + body
-        signature = base64.b64encode(
-            hmac.new(API_SECRET.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest()
-        ).decode('utf-8')
-        passphrase_encoded = base64.b64encode(
-            hmac.new(API_SECRET.encode('utf-8'), API_PASSPHRASE.encode('utf-8'), hashlib.sha256).digest()
-        ).decode('utf-8')
-
-        return {
-            'KC-API-KEY': API_KEY,
-            'KC-API-SIGN': signature,
-            'KC-API-TIMESTAMP': header_timestamp,
-            'KC-API-PASSPHRASE': passphrase_encoded,
-            'KC-API-KEY-VERSION': '2',
-            'Content-Type': 'application/json'
-        }
-    except Exception as e:
-        logging.error(f"Signature generation error: {e}")
-        return None
 
 def get_price():
-    try:
-        url = "https://api.kucoin.com/api/v1/market/orderbook/level1?symbol=BTC-USDT"
-        res = api_request_with_retry("GET", url)
-        if res:
-            data = res.json()
-            if data.get("code") == "200000":
-                val = float(data.get("data", {}).get("price", 0))
-                if val > 0:
-                    return val
-    except Exception as e:
-        logging.error(f"Failed to fetch price: {e}")
-    return None
+    r = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level1", params={"symbol": SYMBOL}, timeout=10)
+    r.raise_for_status()
+    price = r.json().get("data", {}).get("price")
+    if price is None:
+        raise RuntimeError("Could not fetch price")
+    return float(price)
+
 
 def get_balances():
+    endpoint = "/api/v1/accounts"
+    headers = _kucoin_headers(endpoint, "GET")
+    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params={"type": "trade"}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"Balance fetch failed: {data}")
+    usdt, btc = 0.0, 0.0
+    for acc in data.get("data", []):
+        if acc.get("currency") == "USDT":
+            usdt = float(acc.get("available", 0))
+        elif acc.get("currency") == "BTC":
+            btc = float(acc.get("available", 0))
+    return usdt, btc
+
+
+def place_market_buy(usdt_amount):
+    endpoint = "/api/v1/orders"
+    body = {"clientOid": str(int(time.time() * 1000)), "side": "buy", "symbol": SYMBOL,
+            "type": "market", "funds": f"{usdt_amount:.2f}"}
+    body_str = json.dumps(body)
+    headers = _kucoin_headers(endpoint, "POST", body_str)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=10)
+    data = r.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"Buy failed: {data.get('msg', data)}")
+    return data.get("data", {}).get("orderId")
+
+
+def place_market_sell(btc_amount):
+    endpoint = "/api/v1/orders"
+    body = {"clientOid": str(int(time.time() * 1000)) + "s", "side": "sell", "symbol": SYMBOL,
+            "type": "market", "size": f"{btc_amount:.8f}"}
+    body_str = json.dumps(body)
+    headers = _kucoin_headers(endpoint, "POST", body_str)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=10)
+    data = r.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"Sell failed: {data.get('msg', data)}")
+    return data.get("data", {}).get("orderId")
+
+
+def place_stop_loss_sell(btc_amount, stop_price):
+    """Places a native stop-market sell order on KuCoin's own server — triggers
+    continuously on their infrastructure, not our polling loop, so protection
+    is effectively instant rather than limited by our check interval."""
+    endpoint = "/api/v1/stop-order"
+    body = {
+        "clientOid": str(int(time.time() * 1000)) + "sl",
+        "side": "sell", "symbol": SYMBOL, "type": "market",
+        "size": f"{btc_amount:.8f}",
+        "stop": "loss", "stopPrice": f"{stop_price:.2f}",
+    }
+    body_str = json.dumps(body)
+    headers = _kucoin_headers(endpoint, "POST", body_str)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=10)
+    data = r.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"Stop-loss order failed: {data.get('msg', data)}")
+    return data.get("data", {}).get("orderId")
+
+
+def cancel_stop_order(order_id):
+    if not order_id:
+        return
+    endpoint = f"/api/v1/stop-order/{order_id}"
+    headers = _kucoin_headers(endpoint, "DELETE")
     try:
-        endpoint = "/api/v1/accounts"
-        headers = get_kucoin_signature(endpoint, "GET")
-        if not headers:
-            return None, None
-        res = api_request_with_retry("GET", f"https://api.kucoin.com{endpoint}?type=trade", headers=headers)
-        if res:
-            data = res.json()
-            if data.get("code") == "200000":
-                usdt_bal, btc_bal = 0.0, 0.0
-                for acc in data.get("data", []):
-                    if acc.get("currency") == "USDT":
-                        usdt_bal = float(acc.get("available", 0))
-                    elif acc.get("currency") == "BTC":
-                        btc_bal = float(acc.get("available", 0))
-                return usdt_bal, btc_bal
+        r = requests.delete(f"{BASE_URL}{endpoint}", headers=headers, timeout=10)
+        data = r.json()
+        if data.get("code") != "200000":
+            logging.warning(f"Stop order cancel returned: {data}")
     except Exception as e:
-        logging.error(f"Failed to fetch balances: {e}")
-    return None, None
+        logging.warning(f"Stop order cancel failed (may have already triggered): {e}")
 
-def get_klines(timeframe="15min", limit=250):
-    try:
-        url = f"https://api.kucoin.com/api/v1/market/candles?symbol=BTC-USDT&type={timeframe}"
-        res = api_request_with_retry("GET", url)
-        if res:
-            data = res.json()
-            if data.get("code") == "200000":
-                raw_candles = data.get("data", [])
-                closed_candles = raw_candles[1:limit+1] if len(raw_candles) > 1 else []
-                candles = list(reversed(closed_candles))
-                timestamps = [int(c[0]) for c in candles]
-                opens = [float(c[1]) for c in candles]
-                highs = [float(c[3]) for c in candles]
-                lows = [float(c[4]) for c in candles]
-                closes = [float(c[2]) for c in candles]
-                volumes = [float(c[5]) for c in candles]
-                return timestamps, opens, highs, lows, closes, volumes
-    except Exception as e:
-        logging.error(f"Failed to fetch klines for {timeframe}: {e}")
-    return [], [], [], [], [], []
 
-def get_order_details(order_id):
-    try:
-        endpoint = f"/api/v1/orders/{order_id}"
-        headers = get_kucoin_signature(endpoint, "GET")
-        if not headers:
-            return None
-        res = api_request_with_retry("GET", f"https://api.kucoin.com{endpoint}", headers=headers)
-        if res:
-            data = res.json()
-            if data.get("code") == "200000":
-                return data.get("data", {})
-    except Exception as e:
-        logging.error(f"Failed to get order details for {order_id}: {e}")
-    return None
+def log_trade(action, price, amount, order_id, note=""):
+    is_new = not os.path.exists(TRADE_LOG_FILE)
+    with open(TRADE_LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if is_new:
+            writer.writerow(["timestamp", "action", "price", "amount", "order_id", "note"])
+        writer.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), action, price, amount, order_id, note])
 
-def get_order_by_client_oid(client_oid):
-    try:
-        endpoint = f"/api/v1/orders/client-order/{client_oid}"
-        headers = get_kucoin_signature(endpoint, "GET")
-        if not headers:
-            return None
-        res = api_request_with_retry("GET", f"https://api.kucoin.com{endpoint}", headers=headers)
-        if res:
-            data = res.json()
-            if data.get("code") == "200000":
-                return data.get("data", {})
-    except Exception as e:
-        logging.error(f"Failed to get order by client OID {client_oid}: {e}")
-    return None
 
-# --- STATE RECONCILIATION LOGIC ---
-def reconcile_state_with_exchange():
-    try:
-        _, btc_bal = get_balances()
-        if btc_bal is None:
-            return
-
-        state = get_state()
-        in_pos = state.get("in_position", False)
-        dust_threshold = 0.00001
-
-        if btc_bal > dust_threshold and not in_pos:
-            price = get_price() or 0.0
-            state["in_position"] = True
-            state["position_size"] = btc_bal
-            state["initial_position_size"] = btc_bal
-            if state.get("entry_price", 0.0) == 0.0:
-                state["entry_price"] = price
-            if state.get("highest_price_since_entry", 0.0) == 0.0:
-                state["highest_price_since_entry"] = price
-            save_state(state)
-            send_whatsapp_message(f"🔄 **State Reconciled**: Detected {btc_bal} BTC on exchange. Bot state updated to IN POSITION.")
-
-        elif btc_bal <= dust_threshold and in_pos:
-            state["in_position"] = False
-            state["entry_price"] = 0.0
-            state["position_size"] = 0.0
-            state["initial_position_size"] = 0.0
-            state["dynamic_sl"] = 0.0
-            state["dynamic_tp"] = 0.0
-            state["tp1_hit"] = False
-            state["highest_price_since_entry"] = 0.0
-            state["break_even_activated"] = False
-            save_state(state)
-            send_whatsapp_message("🔄 **State Reconciled**: 0 BTC found on exchange. Bot state updated to OUT OF POSITION.")
-    except Exception as e:
-        logging.error(f"Error during state reconciliation: {e}")
-
-# --- ORDER EXECUTION ---
-def place_market_buy_with_slippage_check(amount_usdt, expected_price):
+# --- WHATSAPP (direct send, correct Content-Type, logs success/failure) ---
+def send_whatsapp(message, chat_id=None):
+    target = chat_id or MY_PHONE_CHAT_ID
+    url = f"https://7107.api.greenapi.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
     for attempt in range(3):
-        client_oid = f"buy_{int(time.time() * 1000)}_{attempt}"
         try:
-            endpoint = "/api/v1/orders"
-            body_dict = {
-                "clientOid": client_oid,
-                "side": "buy",
-                "symbol": "BTC-USDT",
-                "type": "market",
-                "funds": str(amount_usdt)
-            }
-            body_str = json.dumps(body_dict)
-            headers = get_kucoin_signature(endpoint, "POST", body_str)
-            if not headers:
-                continue
-            res = api_request_with_retry("POST", f"https://api.kucoin.com{endpoint}", headers=headers, data=body_str)
-            if res:
-                res_data = res.json()
-                if res_data.get("code") == "200000":
-                    order_id = res_data.get('data', {}).get('orderId')
-                    for _ in range(5):
-                        time.sleep(1.0)
-                        details = get_order_details(order_id)
-                        if details:
-                            deal_size = float(details.get("dealSize", 0) or 0)
-                            deal_funds = float(details.get("dealFunds", 0) or 0)
-                            is_done = details.get("isDone", False)
-                            if is_done or deal_size > 0:
-                                filled_price = deal_funds / deal_size if deal_size > 0 else expected_price
-                                slippage = abs(filled_price - expected_price) / expected_price
-                                if slippage > MAX_SLIPPAGE_PCT:
-                                    logging.warning(f"Slippage violation on BUY! Filled: {filled_price}, Expected: {expected_price}")
-                                return order_id, deal_size, deal_funds, is_done
-
-            fallback = get_order_by_client_oid(client_oid)
-            if fallback and fallback.get("id"):
-                deal_size = float(fallback.get("dealSize", 0) or 0)
-                deal_funds = float(fallback.get("dealFunds", 0) or 0)
-                return fallback.get("id"), deal_size, deal_funds, fallback.get("isDone", False)
+            r = requests.post(url, json={"chatId": target, "message": message}, timeout=10)
+            if r.status_code in (200, 201):
+                logging.info(f"WhatsApp sent: {message[:50]!r}")
+                return True
+            logging.error(f"WhatsApp send failed: {r.status_code} {r.text[:200]}")
         except Exception as e:
-            logging.error(f"Market buy execution error on attempt {attempt+1}: {e}")
-        time.sleep(2.0)
-    return None, 0.0, 0.0, False
+            logging.error(f"WhatsApp send exception: {e}")
+        time.sleep(2 ** attempt)
+    return False
 
-def place_market_sell_with_slippage_check(size, expected_price):
-    for attempt in range(3):
-        client_oid = f"sell_{int(time.time() * 1000)}_{attempt}"
-        try:
-            endpoint = "/api/v1/orders"
-            body_dict = {
-                "clientOid": client_oid,
-                "side": "sell",
-                "symbol": "BTC-USDT",
-                "type": "market",
-                "size": str(size)
-            }
-            body_str = json.dumps(body_dict)
-            headers = get_kucoin_signature(endpoint, "POST", body_str)
-            if not headers:
-                continue
-            res = api_request_with_retry("POST", f"https://api.kucoin.com{endpoint}", headers=headers, data=body_str)
-            if res:
-                res_data = res.json()
-                if res_data.get("code") == "200000":
-                    order_id = res_data.get('data', {}).get('orderId')
-                    for _ in range(5):
-                        time.sleep(1.0)
-                        details = get_order_details(order_id)
-                        if details:
-                            deal_size = float(details.get("dealSize", 0) or 0)
-                            deal_funds = float(details.get("dealFunds", 0) or 0)
-                            is_done = details.get("isDone", False)
-                            if is_done or deal_size > 0:
-                                filled_price = deal_funds / deal_size if deal_size > 0 else expected_price
-                                slippage = abs(filled_price - expected_price) / expected_price
-                                if slippage > MAX_SLIPPAGE_PCT:
-                                    logging.warning(f"Slippage violation on SELL! Filled: {filled_price}, Expected: {expected_price}")
-                                return order_id, deal_size, deal_funds, is_done
 
-            fallback = get_order_by_client_oid(client_oid)
-            if fallback and fallback.get("id"):
-                deal_size = float(fallback.get("dealSize", 0) or 0)
-                deal_funds = float(fallback.get("dealFunds", 0) or 0)
-                return fallback.get("id"), deal_size, deal_funds, fallback.get("isDone", False)
-        except Exception as e:
-            logging.error(f"Market sell execution error on attempt {attempt+1}: {e}")
-        time.sleep(2.0)
-    return None, 0.0, 0.0, False
-
-# --- TECHNICAL INDICATORS ---
-def calculate_ema(data, period):
-    if not data:
-        return 0.0
-    if len(data) < period:
-        return sum(data) / len(data)
-    multiplier = 2 / (period + 1)
-    ema = sum(data[:period]) / period
-    for price in data[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
-
-def calculate_sma(data, period):
-    if not data:
-        return 0.0
-    if len(data) < period:
-        return sum(data) / len(data)
-    return sum(data[-period:]) / period
-
-def calculate_atr(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return 0.0
-    tr_list = []
-    for i in range(1, len(closes)):
-        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-        tr_list.append(tr)
-    if not tr_list:
-        return 0.0
-    atr = sum(tr_list[:min(period, len(tr_list))]) / min(period, len(tr_list))
-    for tr in tr_list[period:]:
-        atr = (atr * (period - 1) + tr) / period
-    return atr
-
-def calculate_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
-
-def calculate_true_macd(closes, fast=12, slow=26, signal_period=9):
-    min_required = slow + signal_period
-    if not closes or len(closes) < min_required:
-        return 0.0, 0.0, 0.0, 0.0
-
-    k_fast = 2 / (fast + 1)
-    k_slow = 2 / (slow + 1)
-
-    ema_fast = sum(closes[:fast]) / fast
-    ema_slow = sum(closes[:slow]) / slow
-
-    macd_line_series = []
-    for i in range(len(closes)):
-        if i >= fast:
-            ema_fast = (closes[i] - ema_fast) * k_fast + ema_fast
-        if i >= slow:
-            ema_slow = (closes[i] - ema_slow) * k_slow + ema_slow
-            if i >= slow - 1:
-                macd_line_series.append(ema_fast - ema_slow)
-
-    if len(macd_line_series) < signal_period:
-        return 0.0, 0.0, 0.0, 0.0
-
-    k_signal = 2 / (signal_period + 1)
-    signal_series = []
-    sig_ema = sum(macd_line_series[:signal_period]) / signal_period
-
-    for i in range(len(macd_line_series)):
-        if i < signal_period:
-            signal_series.append(sig_ema)
-        else:
-            sig_ema = (macd_line_series[i] - sig_ema) * k_signal + sig_ema
-            signal_series.append(sig_ema)
-
-    current_macd = macd_line_series[-1]
-    prev_macd = macd_line_series[-2] if len(macd_line_series) > 1 else current_macd
-    current_signal = signal_series[-1]
-    prev_signal = signal_series[-2] if len(signal_series) > 1 else current_signal
-
-    return current_macd, current_signal, prev_macd, prev_signal
-
-def calculate_adx(highs, lows, closes, period=14):
-    if len(closes) < period * 2:
-        return 20.0
-    try:
-        tr_list, plus_dm_list, minus_dm_list = [], [], []
-        for i in range(1, len(closes)):
-            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-            tr_list.append(tr)
-            up_move = highs[i] - highs[i-1]
-            down_move = lows[i-1] - lows[i]
-            plus_dm_list.append(up_move if up_move > down_move and up_move > 0 else 0.0)
-            minus_dm_list.append(down_move if down_move > up_move and down_move > 0 else 0.0)
-
-        atr_smooth = sum(tr_list[:period])
-        plus_smooth = sum(plus_dm_list[:period])
-        minus_smooth = sum(minus_dm_list[:period])
-        dx_list = []
-        for i in range(period, len(tr_list)):
-            atr_smooth = atr_smooth - (atr_smooth / period) + tr_list[i]
-            plus_smooth = plus_smooth - (plus_smooth / period) + plus_dm_list[i]
-            minus_smooth = minus_smooth - (minus_smooth / period) + minus_dm_list[i]
-            plus_di = 100 * (plus_smooth / atr_smooth) if atr_smooth > 0 else 0
-            minus_di = 100 * (minus_smooth / atr_smooth) if atr_smooth > 0 else 0
-            di_sum = plus_di + minus_di
-            dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
-            dx_list.append(dx)
-
-        if not dx_list:
-            return 20.0
-        adx = sum(dx_list[:period]) / period
-        for dx in dx_list[period:]:
-            adx = ((adx * (period - 1)) + dx) / period
-        return adx
-    except Exception as e:
-        logging.error(f"ADX calculation error: {e}")
-        return 20.0
-
-def generate_signal():
-    timestamps, o15, h15, l15, c15, v15 = get_klines("15min", 250)
-    _, _, _, _, c1h, _ = get_klines("1hour", 100)
-
-    if len(c15) < max(MA_LONG, EMA_TREND_PERIOD) or len(c1h) < EMA_TREND_1H_PERIOD:
-        return "HOLD", {"reason": "Insufficient history"}, 0
-
-    latest_candle_time = timestamps[-1] if timestamps else 0
-
-    prev_short = calculate_sma(c15[:-1], MA_SHORT)
-    curr_short = calculate_sma(c15, MA_SHORT)
-    prev_long = calculate_sma(c15[:-1], MA_LONG)
-    curr_long = calculate_sma(c15, MA_LONG)
-
-    ema_trend_15m = calculate_ema(c15, EMA_TREND_PERIOD)
-    ema_trend_1h = calculate_ema(c1h, EMA_TREND_1H_PERIOD)
-
-    rsi = calculate_rsi(c15, RSI_PERIOD)
-    adx = calculate_adx(h15, l15, c15, ADX_PERIOD)
-    atr = calculate_atr(h15, l15, c15, ATR_PERIOD)
-
-    vol_sma_20 = calculate_sma(v15, 20)
-    volume_ok = v15[-1] > vol_sma_20 if v15 else False
-
-    curr_macd, curr_signal, prev_macd, prev_signal = calculate_true_macd(c15)
-
-    is_bullish_crossover = (prev_short <= prev_long) and (curr_short > curr_long)
-    is_bearish_crossover = (prev_short >= prev_long) and (curr_short < curr_long)
-
-    macd_bullish_crossover = (prev_macd <= prev_signal) and (curr_macd > curr_signal)
-    macd_bearish_crossover = (prev_macd >= prev_signal) and (curr_macd < curr_signal)
-
-    trend_up = (c15[-1] > ema_trend_15m) and (c1h[-1] > ema_trend_1h)
-    trend_down = (c15[-1] < ema_trend_15m) and (c1h[-1] < ema_trend_1H_PERIOD if 'EMA_TREND_1H_PERIOD' in globals() else c1h[-1] < ema_trend_1h)
-
-    adx_ok = adx > ADX_THRESHOLD
-    rsi_buy_ok = (RSI_LOWER <= rsi <= RSI_UPPER)
-    rsi_sell_ok = (35 <= rsi <= 60)
-
-    if is_bullish_crossover and trend_up and macd_bullish_crossover and adx_ok and rsi_buy_ok and volume_ok:
-        return "BUY", {"reason": "BUY: Enhanced filters passed", "atr": atr}, latest_candle_time
-
-    elif is_bearish_crossover and trend_down and macd_bearish_crossover and rsi_sell_ok:
-        return "SELL", {"reason": "SELL: Bearish confirmation & RSI filter passed", "atr": atr}, latest_candle_time
-
-    return "HOLD", {"reason": "No condition met", "atr": atr}, latest_candle_time
-
-# --- METRICS ---
-def calculate_trading_metrics():
-    try:
-        if not os.path.isfile(CSV_JOURNAL_FILE):
-            return "No trade records found yet."
-
-        pnl_list = []
-        equity_list = []
-
-        if os.path.isfile(EQUITY_CURVE_FILE):
-            with open(EQUITY_CURVE_FILE, mode='r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    try:
-                        equity_list.append(float(row["TotalEquity"]))
-                    except:
-                        pass
-
-        with open(CSV_JOURNAL_FILE, mode='r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            open_position = None
-            for row in reader:
-                action = row["Action"]
-                price = float(row["Price"])
-                size = float(row["SizeOrAmount"])
-
-                if "BUY" in action:
-                    open_position = {"price": price, "size": size}
-                elif any(tag in action for tag in ["SELL", "TP", "STOPLOSS", "PARTIAL"]) and open_position:
-                    entry_p = open_position["price"]
-                    closed_size = size
-                    trade_pnl = (price - entry_p) * closed_size - ((price * closed_size + entry_p * closed_size) * FEE_RATE)
-                    pnl_list.append(trade_pnl)
-
-                    if "PARTIAL" in action:
-                        open_position["size"] -= closed_size
-                        if open_position["size"] <= 0:
-                            open_position = None
-                    else:
-                        open_position = None
-
-        total_trades = len(pnl_list)
-        if total_trades == 0:
-            return "📊 **Performance Metrics**\nTrades: 0 | Win Rate: 0%"
-
-        winning_trades = [p for p in pnl_list if p > 0]
-        losing_trades = [p for p in pnl_list if p <= 0]
-
-        win_rate = (len(winning_trades) / total_trades) * 100
-        gross_profit = sum(winning_trades) if winning_trades else 0
-        gross_loss = abs(sum(losing_trades)) if losing_trades else 1
-        profit_factor = gross_profit / gross_loss if gross_loss > 0 else gross_profit
-
-        max_dd = 0.0
-        if equity_list:
-            peak = equity_list[0]
-            for eq in equity_list:
-                if eq > peak:
-                    peak = eq
-                dd = (peak - eq) / peak if peak > 0 else 0
-                if dd > max_dd:
-                    max_dd = dd
-
-        return (
-            f"📊 **Bot Performance Metrics Dashboard**\n"
-            f"• Total Trades: {total_trades}\n"
-            f"• Win Rate: {win_rate:.2f}%\n"
-            f"• Profit Factor: {profit_factor:.2f}\n"
-            f"• Max Drawdown: {max_dd*100:.2f}%\n"
-            f"• Gross Profit: {gross_profit:.2f} USDT\n"
-            f"• Gross Loss: {gross_loss:.2f} USDT"
-        )
-    except Exception as e:
-        return f"Metrics calculation error: {e}"
-
-# --- 6. MAIN TRADING CYCLE ---
-def run_cycle(notify_whatsapp=True):
+# --- RECONCILIATION (catches state/exchange mismatches, including native stop-loss triggers) ---
+def reconcile_state():
     with trading_lock:
-        reconcile_state_with_exchange()
-        state = get_state()
+        try:
+            state = load_state()
+            usdt, btc = get_balances()
+            price = get_price()
+            btc_value = btc * price
 
-        if is_news_time_restricted():
-            return "Paused: Major economic news window active or news API check failed."
+            if state["in_position"] and btc_value < MIN_TRADE_USDT:
+                # Most likely cause: the native stop-loss order triggered on KuCoin's
+                # side since our last check. Clear position state and, if we have
+                # enough USDT, auto re-buy using the last amount — same behavior as
+                # a programmatic stop-loss exit, just detected after the fact.
+                logging.warning("Reconcile: state says in-position but exchange shows ~0 BTC — likely stop-loss triggered.")
+                state["in_position"] = False
+                state["entry_price"] = 0.0
+                state["entry_qty"] = 0.0
+                state["stop_order_id"] = None
+                amount = state.get("last_buy_amount", 0)
+                save_state(state)
+                send_whatsapp(f"🛡️ Stop-loss appears to have triggered (position closed on exchange).")
+                if amount >= MIN_TRADE_USDT and usdt >= amount:
+                    do_buy(state, price, amount, reason="auto re-entry after stop-loss")
+                else:
+                    send_whatsapp(f"⚠️ Can't auto re-buy (need {amount:.2f}, have {usdt:.2f} USDT). Send 'buy <amount>' when ready.")
+            elif not state["in_position"] and btc_value >= MIN_TRADE_USDT:
+                logging.warning("Reconcile: exchange holds BTC but state says flat. Adopting as current position.")
+                state["in_position"] = True
+                state["entry_price"] = price
+                state["entry_qty"] = btc
+                if not state.get("last_buy_amount"):
+                    state["last_buy_amount"] = round(btc_value, 2)
+                save_state(state)
+                send_whatsapp(f"⚠️ Reconciliation: found {btc:.8f} BTC on exchange not tracked in state — now tracking it (no stop-loss placed for this — consider selling and re-buying via 'buy <amount>' to get protection).")
+        except Exception as e:
+            logging.exception(f"Reconciliation failed: {e}")
 
-        if not check_market_liquidity_and_spread():
-            return "Paused: Insufficient liquidity, spread too wide, or orderbook check failed."
+
+# --- TRADE ACTIONS ---
+def do_buy(state, price, amount, reason=""):
+    order_id = place_market_buy(amount)
+    approx_qty = amount * (1 - FEE_RATE) / price
+    state["in_position"] = True
+    state["entry_price"] = price
+    state["entry_qty"] = approx_qty
+    state["last_buy_amount"] = amount
+    save_state(state)
+    log_trade("BUY", price, amount, order_id, note=reason)
+
+    stop_price = price * (1 - STOP_LOSS_PCT)
+    stop_order_id = None
+    if STOP_LOSS_PCT > 0:
+        try:
+            stop_order_id = place_stop_loss_sell(approx_qty, stop_price)
+            state["stop_order_id"] = stop_order_id
+            save_state(state)
+        except Exception as e:
+            logging.error(f"Failed to place stop-loss order: {e}")
+            send_whatsapp(f"⚠️ Bought but stop-loss order FAILED to place: {e}\nPosition is unprotected — check manually.")
+
+    msg = f"🟢 Bought {amount:.2f} USDT @ ${price:,.2f}" + (f" ({reason})" if reason else "")
+    if stop_order_id:
+        msg += f"\n🛡️ Stop-loss set @ ${stop_price:,.2f} ({STOP_LOSS_PCT*100:.1f}%, order {stop_order_id})"
+    send_whatsapp(msg)
+
+
+def do_sell(state, price, reason):
+    # cancel the resting stop-loss order first — otherwise it could also try
+    # to execute against a position we're about to close ourselves
+    if state.get("stop_order_id"):
+        cancel_stop_order(state["stop_order_id"])
+        state["stop_order_id"] = None
+
+    qty = state["entry_qty"]
+    order_id = place_market_sell(qty)
+    sell_value = qty * price * (1 - FEE_RATE)
+    buy_value = qty * state["entry_price"] * (1 + FEE_RATE)
+    realized = sell_value - buy_value
+    state["total_realized_profit_usdt"] = state.get("total_realized_profit_usdt", 0.0) + realized
+    log_trade("SELL", price, qty, order_id, note=f"{reason}, realized={realized:.4f}")
+    send_whatsapp(f"🔴 Sold ({reason}) @ ${price:,.2f}\nRealized: {realized:+.4f} USDT\n"
+                  f"Total realized: {state['total_realized_profit_usdt']:+.4f} USDT")
+    state["in_position"] = False
+    state["entry_price"] = 0.0
+    state["entry_qty"] = 0.0
+    save_state(state)
+
+
+# --- HOURLY CYCLE (profit-take / stop-loss check) ---
+def run_cycle():
+    reconcile_state()  # also detects & handles a triggered native stop-loss order
+    with trading_lock:
+        state = load_state()
+        if not state["in_position"]:
+            return  # nothing to check — waiting for a "buy <amount>" command
 
         price = get_price()
-        if price is None:
-            return "Failed to fetch market price (API error)."
+        pct_change = (price - state["entry_price"]) / state["entry_price"]
+        logging.info(f"Cycle check: entry=${state['entry_price']:,.2f} now=${price:,.2f} change={pct_change*100:.3f}%")
 
-        time.sleep(0.3)
-        usdt, btc = get_balances()
-        if usdt is None or btc is None:
-            return "Failed to fetch balances (API error)."
+        if pct_change >= PROFIT_TARGET_PCT:
+            do_sell(state, price, f"profit target hit ({pct_change*100:.2f}%)")
+            state = load_state()
+            usdt, _ = get_balances()
+            amount = state.get("last_buy_amount", 0)
+            if amount >= MIN_TRADE_USDT and usdt >= amount:
+                do_buy(state, price, amount, reason="auto re-entry after profit")
+            else:
+                send_whatsapp(f"⚠️ Sold for profit but can't auto re-buy (need {amount:.2f}, have {usdt:.2f} USDT). Send 'buy <amount>' when ready.")
+        # Stop-loss is now handled by the native KuCoin stop order (near-instant,
+        # monitored by their server) plus reconcile_state() detecting the trigger
+        # — no need to check pct_change against STOP_LOSS_PCT here too.
 
-        equity = usdt + (btc * price)
-        log_equity_curve(equity)
-        halted = check_daily_loss_limit(equity)
-        messages = []
 
-        current_time = time.time()
-        last_hb = state.get("last_heartbeat_time", 0.0)
-        if (current_time - last_hb) >= 14400:
-            metrics_summary = calculate_trading_metrics()
-            hb_msg = f"💚 **Bot Health Heartbeat & Metrics**\nStatus: Alive 🟢\nEquity: {equity:.2f} USDT\n\n{metrics_summary}"
-            send_whatsapp_message(hb_msg)
-            state["last_heartbeat_time"] = current_time
-            save_state(state)
-
-        signal, info, candle_ts = generate_signal()
-        current_atr = info.get("atr", 0.0)
-
-        last_processed_candle = state.get("last_candle_timestamp", 0)
-        is_duplicate_candle = (candle_ts > 0 and candle_ts <= last_processed_candle)
-
-        if state["in_position"] and btc > 0:
-            entry = state["entry_price"]
-            initial_size = state.get("initial_position_size", btc)
-            highest_price = max(state.get("highest_price_since_entry", entry), price)
-            state["highest_price_since_entry"] = highest_price
-
-            dynamic_sl = state.get("dynamic_sl", entry - (current_atr * ATR_SL_MULTIPLIER))
-            dynamic_tp2 = state.get("dynamic_tp", entry + (current_atr * ATR_TP2_MULTIPLIER))
-            tp1_price = entry + (current_atr * ATR_TP1_MULTIPLIER)
-
-            tp1_hit = state.get("tp1_hit", False)
-            if not tp1_hit and price >= tp1_price and initial_size > 0:
-                half_size = initial_size * 0.5
-                if btc >= half_size:
-                    order_id, filled_size, deal_funds, is_done = place_market_sell_with_slippage_check(half_size, price)
-                    if order_id and filled_size > 0:
-                        exit_price = deal_funds / filled_size if filled_size > 0 else price
-                        net_realized = (exit_price * filled_size * (1 - FEE_RATE)) - (entry * filled_size * (1 + FEE_RATE))
-                        state["day_realized_pnl"] = state.get("day_realized_pnl", 0.0) + net_realized
-                        state["position_size"] = max(0.0, btc - filled_size)
-                        state["tp1_hit"] = True
-                        if entry > dynamic_sl:
-                            dynamic_sl = entry
-                        state["dynamic_sl"] = dynamic_sl
-                        save_state(state)
-                        log_trade("PARTIAL_TP1", exit_price, filled_size, "TP1 reached", order_id)
-                        messages.append(f"🎯 Partial TP1 hit! Closed 50% @ {exit_price}")
-
-            trailing_sl = highest_price - (current_atr * ATR_SL_MULTIPLIER)
-            if trailing_sl > dynamic_sl:
-                dynamic_sl = trailing_sl
-            state["dynamic_sl"] = dynamic_sl
-            save_state(state)
-
-            is_stop_loss = price <= dynamic_sl
-            is_take_profit = price >= dynamic_tp2
-            is_strong_reversal = (signal == "SELL") and (not is_duplicate_candle)
-
-            if is_stop_loss or is_take_profit or is_strong_reversal:
-                reason_str = "Stop-loss hit" if is_stop_loss else ("Final Take-profit hit" if is_take_profit else "Strong bearish reversal signal")
-                action_tag = "SELL_STOPLOSS" if is_stop_loss else ("SELL_TAKEPROFIT" if is_take_profit else "SELL_REVERSAL")
-
-                current_holdings_size = state.get("position_size", btc)
-                order_id, filled_size, deal_funds, is_done = place_market_sell_with_slippage_check(current_holdings_size, price)
-                if order_id and filled_size > 0:
-                    exit_price = deal_funds / filled_size if filled_size > 0 else price
-                    net_realized = (exit_price * filled_size * (1 - FEE_RATE)) - (entry * filled_size * (1 + FEE_RATE))
-
-                    state["day_realized_pnl"] = state.get("day_realized_pnl", 0.0) + net_realized
-                    state["in_position"] = False
-                    state["entry_price"] = 0.0
-                    state["position_size"] = 0.0
-                    state["initial_position_size"] = 0.0
-                    state["dynamic_sl"] = 0.0
-                    state["dynamic_tp"] = 0.0
-                    state["tp1_hit"] = False
-                    state["highest_price_since_entry"] = 0.0
-                    state["break_even_activated"] = False
-                    if candle_ts > 0:
-                        state["last_candle_timestamp"] = candle_ts
-                    save_state(state)
-                    log_trade(action_tag, exit_price, filled_size, reason_str, order_id)
-                    messages.append(f"🔴 Position fully closed ({reason_str})! P&L: {net_realized:.2f} USDT")
-
-        state = get_state()
-        usdt, btc = get_balances()
-        if usdt is None or btc is None:
-            return "Failed to re-fetch balances after position check."
-
-        if halted:
-            return "Trading halted: Daily loss limit reached."
-
-        last_processed_candle = state.get("last_candle_timestamp", 0)
-        is_duplicate_candle = (candle_ts > 0 and candle_ts <= last_processed_candle)
-
-        last_trade_time = state.get("last_trade_time", 0.0)
-        trades_today = state.get("trades_today_count", 0)
-        in_cooldown = (current_time - last_trade_time) < COOLDOWN_SECONDS
-
-        if not state["in_position"]:
-            if signal == "BUY":
-                if is_duplicate_candle:
-                    messages.append(f"🛡️ Duplicate Candle Protection: Timestamp {candle_ts} already processed.")
-                elif in_cooldown:
-                    messages.append("⏳ Cooldown active.")
-                elif trades_today >= MAX_TRADES_PER_DAY:
-                    messages.append("⚠️ Max daily trades reached.")
-                else:
-                    if current_atr <= 0:
-                        return "Skipped: ATR invalid or zero."
-
-                    risk_amount = equity * RISK_PER_TRADE_PCT
-                    sl_distance = current_atr * ATR_SL_MULTIPLIER
-
-                    position_size_btc = risk_amount / sl_distance
-                    position_value_usdt = position_size_btc * price
-
-                    max_allowed = equity * MAX_POSITION_PCT_CAP
-                    position_value_usdt = min(position_value_usdt, max_allowed)
-
-                    trade_usdt = max(MIN_TRADE_USDT, min(position_value_usdt, usdt))
-
-                    if usdt >= trade_usdt:
-                        order_id, filled_size, deal_funds, is_done = place_market_buy_with_slippage_check(trade_usdt, price)
-                        if order_id and filled_size > 0:
-                            actual_qty = filled_size
-                            actual_cost = deal_funds if deal_funds > 0 else trade_usdt
-                            actual_entry_price = actual_cost / actual_qty if actual_qty > 0 else price
-
-                            state["in_position"] = True
-                            state["entry_price"] = actual_entry_price
-                            state["position_size"] = actual_qty
-                            state["initial_position_size"] = actual_qty
-                            state["dynamic_sl"] = actual_entry_price - (current_atr * ATR_SL_MULTIPLIER)
-                            state["dynamic_tp"] = actual_entry_price + (current_atr * ATR_TP2_MULTIPLIER)
-                            state["tp1_hit"] = False
-                            state["highest_price_since_entry"] = actual_entry_price
-                            state["trades_today_count"] = trades_today + 1
-                            state["last_trade_time"] = current_time
-                            if candle_ts > 0:
-                                state["last_candle_timestamp"] = candle_ts
-                            save_state(state)
-
-                            log_trade("BUY", actual_entry_price, actual_qty, info.get('reason'), order_id)
-                            messages.append(f"✅ BUY executed: Size {actual_qty:.6f} BTC @ {actual_entry_price}")
-
-        if not messages:
-            messages.append("Cycle complete. No action required.")
-
-        report = f"🤖 Bot Cycle Report\nPrice: ${price} | USDT: {usdt:.2f}\n\n" + "\n".join(messages)
-        if notify_whatsapp:
-            send_whatsapp_message(report)
-        return report
-
-def background_trading_loop():
+def background_loop():
     while not shutdown_flag.is_set():
         try:
-            run_cycle(notify_whatsapp=True)
-        except Exception as e:
-            logging.exception(f"Background loop error: {e}")
+            run_cycle()
+        except Exception:
+            logging.exception("Background cycle error")
+            try:
+                send_whatsapp(f"⚠️ Bot error during hourly check — check logs.")
+            except Exception:
+                pass
         for _ in range(LOOP_INTERVAL_SECONDS):
             if shutdown_flag.is_set():
                 break
             time.sleep(1)
 
+
 def _start_background_loop_once():
     global background_thread_ref
-    if getattr(app, "_bg_loop_started", False):
+    if getattr(app, "_bg_started", False):
         return
-    
-    try:
-        reconcile_state_with_exchange()
-        background_thread_ref = threading.Thread(target=background_trading_loop, daemon=True)
-        background_thread_ref.start()
-        app._bg_loop_started = True
-        logging.info("Background trading loop started successfully.")
-    except Exception as e:
-        logging.error(f"Failed to start background loop: {e}")
+    reconcile_state()
+    background_thread_ref = threading.Thread(target=background_loop, daemon=True)
+    background_thread_ref.start()
+    app._bg_started = True
+
 
 _start_background_loop_once()
 
-def shutdown_link_actions(signum=None, frame=None):
+
+# --- CASUAL AI CHAT (Groq) — completely separate from trading logic. ---
+# This function can only ever return a text reply; it has no access to do_buy/
+# do_sell/place_market_* and cannot execute trades under any circumstances.
+# Trading commands are matched and handled deterministically in handle_command()
+# BEFORE this is ever reached — the AI only sees messages that didn't match
+# 'buy <amount>', 'sell', or 'status'.
+def get_ai_reply(user_text):
+    if not GROQ_API_KEY:
+        return "Commands: 'buy <amount>' | 'sell' | 'status'"
+    try:
+        state = load_state()
+        context = (
+            f"You are a WhatsApp assistant for a crypto trading bot. Be brief and casual. "
+            f"Current status: {'in a BTC position' if state.get('in_position') else 'not in a position'}. "
+            f"You do NOT execute trades yourself — only the commands 'buy <amount>', 'sell', and 'status' do. "
+            f"If the user seems to want to trade, remind them to use those exact commands. "
+            f"Do not give financial advice or price predictions."
+        )
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": context},
+                    {"role": "user", "content": user_text},
+                ],
+                "temperature": 0.7,
+                "max_tokens": 200,
+            },
+            timeout=15,
+        )
+        data = r.json()
+        if r.status_code == 200:
+            return data["choices"][0]["message"]["content"].strip()
+        logging.error(f"Groq API error: {r.status_code} {data}")
+        return "Sorry, AI chat is temporarily unavailable. Commands: 'buy <amount>' | 'sell' | 'status'"
+    except Exception as e:
+        logging.error(f"Groq request failed: {e}")
+        return "Sorry, AI chat is temporarily unavailable. Commands: 'buy <amount>' | 'sell' | 'status'"
+
+
+# --- WHATSAPP COMMAND HANDLING ---
+def handle_command(text, chat_id):
+    """Top-level wrapper: any exception (e.g. KuCoin rejects an order below
+    its own minimum size) gets reported back via WhatsApp instead of silently
+    dying in the background thread, which is where this runs."""
+    try:
+        _handle_command_inner(text, chat_id)
+    except Exception as e:
+        logging.exception("Command handling failed")
+        send_whatsapp(f"❌ Command failed: {e}", chat_id)
+
+
+def _handle_command_inner(text, chat_id):
+    text = text.strip().lower()
+    with trading_lock:
+        state = load_state()
+
+    if text.startswith("buy"):
+        parts = text.split()
+        if len(parts) < 2:
+            send_whatsapp("Usage: buy <amount>  e.g. 'buy 100'", chat_id)
+            return
+        try:
+            amount = float(parts[1])
+        except ValueError:
+            send_whatsapp("Amount ekak type karanna. e.g. 'buy 100'", chat_id)
+            return
+        if amount < MIN_TRADE_USDT:
+            send_whatsapp(f"Minimum trade amount is {MIN_TRADE_USDT} USDT.", chat_id)
+            return
+        with trading_lock:
+            state = load_state()
+            if state["in_position"]:
+                send_whatsapp("Already in a position. Send 'sell' to close it first, or 'status' to check.", chat_id)
+                return
+            usdt, _ = get_balances()
+            if usdt < amount:
+                send_whatsapp(f"Insufficient balance. Need {amount:.2f}, have {usdt:.2f} USDT.", chat_id)
+                return
+            price = get_price()
+            do_buy(state, price, amount, reason="manual command")
+
+    elif text == "sell":
+        with trading_lock:
+            state = load_state()
+            if not state["in_position"]:
+                send_whatsapp("No open position to sell.", chat_id)
+                return
+            price = get_price()
+            do_sell(state, price, "manual sell command")
+
+    elif text == "status":
+        with trading_lock:
+            state = load_state()
+        try:
+            price = get_price()
+            usdt, btc = get_balances()
+        except Exception:
+            price, usdt, btc = 0.0, 0.0, 0.0
+        if state["in_position"]:
+            pct = (price - state["entry_price"]) / state["entry_price"] * 100 if state["entry_price"] else 0
+            msg = (f"📊 Status\nIn position: YES\nEntry: ${state['entry_price']:,.2f}\n"
+                   f"Current: ${price:,.2f} ({pct:+.3f}%)\nProfit target: {PROFIT_TARGET_PCT*100:.2f}% | "
+                   f"Stop-loss: {STOP_LOSS_PCT*100:.1f}%\nTotal realized: {state.get('total_realized_profit_usdt', 0):+.4f} USDT\n"
+                   f"USDT: {usdt:.2f} | BTC: {btc:.8f}")
+        else:
+            msg = (f"📊 Status\nIn position: NO\nLast buy amount: {state.get('last_buy_amount', 0):.2f}\n"
+                   f"Total realized: {state.get('total_realized_profit_usdt', 0):+.4f} USDT\n"
+                   f"USDT: {usdt:.2f} | BTC: {btc:.8f}\nSend 'buy <amount>' to open a position.")
+        send_whatsapp(msg, chat_id)
+
+    else:
+        reply = get_ai_reply(text)
+        send_whatsapp(reply, chat_id)
+
+
+# --- WEBHOOK (with duplicate-delivery protection) ---
+_recent_message_ids = []
+_recent_ids_lock = threading.Lock()
+_MAX_RECENT_IDS = 200
+
+
+def _is_duplicate(message_id):
+    if not message_id:
+        return False
+    with _recent_ids_lock:
+        if message_id in _recent_message_ids:
+            return True
+        _recent_message_ids.append(message_id)
+        if len(_recent_message_ids) > _MAX_RECENT_IDS:
+            del _recent_message_ids[0]
+        return False
+
+
+@app.route('/webhook/<path:secret_token>', methods=['POST'])
+def webhook(secret_token):
+    if not hmac.compare_digest(secret_token, WEBHOOK_SECRET):
+        abort(403)
+
+    data = request.json or {}
+    message_id = data.get("idMessage") or data.get("messageData", {}).get("idMessage")
+    if _is_duplicate(message_id):
+        return "OK", 200
+
+    try:
+        msg_data = data.get("messageData", {})
+        if msg_data.get("typeMessage") == "textMessage":
+            text = msg_data.get("textMessageData", {}).get("textMessage", "")
+            chat_id = data.get("senderData", {}).get("chatId", "")
+            if chat_id == MY_PHONE_CHAT_ID:
+                threading.Thread(target=handle_command, args=(text, chat_id), daemon=True).start()
+    except Exception:
+        logging.exception("Webhook processing error")
+
+    return "OK", 200
+
+
+# --- SHUTDOWN ---
+def shutdown_handler(signum=None, frame=None):
     shutdown_flag.set()
     global background_thread_ref
     if background_thread_ref and background_thread_ref.is_alive():
         background_thread_ref.join(timeout=5.0)
-    try:
-        state = get_state()
-        save_state(state)
-        send_whatsapp_message("⚠️ Bot shutdown gracefully. State saved successfully.")
-    except Exception as check_err:
-        logging.error(f"Shutdown action error: {check_err}")
+    sys.exit(0)
 
-signal.signal(signal.SIGTERM, shutdown_link_actions)
-signal.signal(signal.SIGINT, shutdown_link_actions)
 
-# --- 7. SECURE WEBHOOK (Green API Compatible & AI Chat) ---
-@app.route('/webhook/<path:secret_token>', methods=['POST'])
-def secure_webhook(secret_token):
-    if not hmac.compare_digest(secret_token, WEBHOOK_SECRET):
-        abort(403, description="Unauthorized Token")
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
 
-    data = request.json or {}
-    
-    logging.info(f"RECEIVED WEBHOOK DATA: {json.dumps(data, indent=2)}")
-    
-    try:
-        if "messageData" in data:
-            sender_data = data.get("senderData", {})
-            chat_id = sender_data.get("chatId", "")
-            
-            if not chat_id:
-                chat_id = data.get("chatId", "")
-            
-            logging.info(f"Extracted Chat ID: {chat_id} | Expected: {MY_PHONE_CHAT_ID}")
-
-            if MY_PHONE_CHAT_ID not in chat_id:
-                return "OK", 200
-
-            msg_data = data.get("messageData", {})
-            text = ""
-            type_msg = msg_data.get("typeMessage", "")
-
-            if type_msg == "textMessage":
-                text = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
-            elif type_msg == "extendedTextMessage":
-                text = msg_data.get("extendedTextMessageData", {}).get("text", "").strip()
-
-            if not text:
-                return "OK", 200
-
-            text_lower = text.lower().strip()
-
-            trading_triggers = ["trade", "status", "cycle", "run", "bot"]
-            is_trading_cmd = any(
-                text_lower == t or text_lower.startswith(t + " ")
-                for t in trading_triggers
-            )
-
-            if is_trading_cmd:
-                threading.Thread(
-                    target=run_cycle,
-                    kwargs={"notify_whatsapp": True},
-                    daemon=True
-                ).start()
-            else:
-                def ai_reply_task():
-                    reply = get_ai_reply(text)
-                    send_whatsapp_message(reply, chat_id)
-                threading.Thread(target=ai_reply_task, daemon=True).start()
-
-    except Exception as e:
-        logging.error(f"Webhook processing error: {e}")
-    return "OK", 200
 
 if __name__ == "__main__":
-    try:
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-    finally:
-        shutdown_link_actions()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
