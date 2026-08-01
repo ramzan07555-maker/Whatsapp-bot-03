@@ -490,6 +490,15 @@ def webhook(secret_token):
         abort(403)
 
     data = request.json or {}
+
+    # Green API sends webhooks for several event types — incoming messages,
+    # but also delivery/status updates about messages WE sent (outgoingMessageStatus,
+    # outgoingAPIMessageReceived, etc). Without this check, the bot's own replies
+    # could get echoed back and processed as if they were new incoming messages,
+    # causing a self-triggering reply loop. Only react to genuine incoming messages.
+    if data.get("typeWebhook") != "incomingMessageReceived":
+        return "OK", 200
+
     message_id = data.get("idMessage") or data.get("messageData", {}).get("idMessage")
     if _is_duplicate(message_id):
         return "OK", 200
@@ -499,8 +508,17 @@ def webhook(secret_token):
         if msg_data.get("typeMessage") == "textMessage":
             text = msg_data.get("textMessageData", {}).get("textMessage", "")
             chat_id = data.get("senderData", {}).get("chatId", "")
+            logging.info(f"Webhook diag: received chat_id={chat_id!r} expected={MY_PHONE_CHAT_ID!r} match={chat_id == MY_PHONE_CHAT_ID} text={text!r}")
             if chat_id == MY_PHONE_CHAT_ID:
-                threading.Thread(target=handle_command, args=(text, chat_id), daemon=True).start()
+                # Process synchronously (not in a background thread). On Render's
+                # free tier, the process can idle/suspend right after this request
+                # returns — a background thread doing KuCoin + WhatsApp calls could
+                # get cut off mid-flight before the reply is ever sent. Blocking
+                # here until handle_command finishes guarantees the reply goes out
+                # before the response completes, at the cost of a slower webhook ack.
+                handle_command(text, chat_id)
+            else:
+                logging.warning(f"Webhook: chat_id mismatch, message ignored. Full payload: {json.dumps(data)[:500]}")
     except Exception:
         logging.exception("Webhook processing error")
 
