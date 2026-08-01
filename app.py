@@ -93,7 +93,7 @@ def _kucoin_headers(endpoint, method, body=""):
 
 
 def get_price():
-    r = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level1", params={"symbol": SYMBOL}, timeout=10)
+    r = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level1", params={"symbol": SYMBOL}, timeout=7)
     r.raise_for_status()
     price = r.json().get("data", {}).get("price")
     if price is None:
@@ -104,7 +104,7 @@ def get_price():
 def get_balances():
     endpoint = "/api/v1/accounts"
     headers = _kucoin_headers(endpoint, "GET")
-    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params={"type": "trade"}, timeout=10)
+    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params={"type": "trade"}, timeout=7)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != "200000":
@@ -124,7 +124,7 @@ def place_market_buy(usdt_amount):
             "type": "market", "funds": f"{usdt_amount:.2f}"}
     body_str = json.dumps(body)
     headers = _kucoin_headers(endpoint, "POST", body_str)
-    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=10)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=7)
     data = r.json()
     if data.get("code") != "200000":
         raise RuntimeError(f"Buy failed: {data.get('msg', data)}")
@@ -137,7 +137,7 @@ def place_market_sell(btc_amount):
             "type": "market", "size": f"{btc_amount:.8f}"}
     body_str = json.dumps(body)
     headers = _kucoin_headers(endpoint, "POST", body_str)
-    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=10)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=7)
     data = r.json()
     if data.get("code") != "200000":
         raise RuntimeError(f"Sell failed: {data.get('msg', data)}")
@@ -157,7 +157,7 @@ def place_stop_loss_sell(btc_amount, stop_price):
     }
     body_str = json.dumps(body)
     headers = _kucoin_headers(endpoint, "POST", body_str)
-    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=10)
+    r = requests.post(f"{BASE_URL}{endpoint}", headers=headers, data=body_str, timeout=7)
     data = r.json()
     if data.get("code") != "200000":
         raise RuntimeError(f"Stop-loss order failed: {data.get('msg', data)}")
@@ -170,7 +170,7 @@ def cancel_stop_order(order_id):
     endpoint = f"/api/v1/stop-order/{order_id}"
     headers = _kucoin_headers(endpoint, "DELETE")
     try:
-        r = requests.delete(f"{BASE_URL}{endpoint}", headers=headers, timeout=10)
+        r = requests.delete(f"{BASE_URL}{endpoint}", headers=headers, timeout=7)
         data = r.json()
         if data.get("code") != "200000":
             logging.warning(f"Stop order cancel returned: {data}")
@@ -191,9 +191,12 @@ def log_trade(action, price, amount, order_id, note=""):
 def send_whatsapp(message, chat_id=None):
     target = chat_id or MY_PHONE_CHAT_ID
     url = f"https://7107.api.greenapi.com/waInstance{ID_INSTANCE}/sendMessage/{API_TOKEN}"
-    for attempt in range(3):
+    # Worst case here must stay comfortably under gunicorn's worker timeout —
+    # 2 attempts x 6s request timeout + up to 2s backoff = ~14s max, so this can
+    # never be the thing that gets a worker killed mid-request.
+    for attempt in range(2):
         try:
-            r = requests.post(url, json={"chatId": target, "message": message}, timeout=10)
+            r = requests.post(url, json={"chatId": target, "message": message}, timeout=6)
             if r.status_code in (200, 201):
                 logging.info(f"WhatsApp sent: {message[:50]!r}")
                 return True
@@ -510,13 +513,19 @@ def webhook(secret_token):
             chat_id = data.get("senderData", {}).get("chatId", "")
             logging.info(f"Webhook diag: received chat_id={chat_id!r} expected={MY_PHONE_CHAT_ID!r} match={chat_id == MY_PHONE_CHAT_ID} text={text!r}")
             if chat_id == MY_PHONE_CHAT_ID:
-                # Process synchronously (not in a background thread). On Render's
-                # free tier, the process can idle/suspend right after this request
-                # returns — a background thread doing KuCoin + WhatsApp calls could
-                # get cut off mid-flight before the reply is ever sent. Blocking
-                # here until handle_command finishes guarantees the reply goes out
-                # before the response completes, at the cost of a slower webhook ack.
-                handle_command(text, chat_id)
+                # Bounded wait: start the work in a thread, wait up to 25s for it
+                # to finish before returning. This gives the reply time to actually
+                # go out before the HTTP response completes (avoiding the original
+                # bug where Render's free-tier spin-down cut off a fire-and-forget
+                # background thread before send_whatsapp ran). But capping the wait
+                # at 25s — safely under gunicorn's worker timeout — means a slow
+                # KuCoin/WhatsApp call can no longer get the whole worker process
+                # killed (which is what caused the 500s and worker restarts).
+                t = threading.Thread(target=handle_command, args=(text, chat_id), daemon=True)
+                t.start()
+                t.join(timeout=25)
+                if t.is_alive():
+                    logging.warning("handle_command still running after 25s — returning response, thread continues in background.")
             else:
                 logging.warning(f"Webhook: chat_id mismatch, message ignored. Full payload: {json.dumps(data)[:500]}")
     except Exception:
