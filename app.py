@@ -27,6 +27,14 @@ def _clean_env(name, default=None):
 API_KEY = _clean_env("KUCOIN_API_KEY")
 API_SECRET = _clean_env("KUCOIN_API_SECRET")
 API_PASSPHRASE = _clean_env("KUCOIN_PASSPHRASE")
+
+logging.info(
+    f"KuCoin creds diag: API_KEY={API_KEY!r} (len={len(API_KEY) if API_KEY else 0}), "
+    f"API_SECRET_masked={(API_SECRET[:4] + '...' + API_SECRET[-4:]) if API_SECRET and len(API_SECRET) > 8 else 'MISSING'} "
+    f"(len={len(API_SECRET) if API_SECRET else 0}), "
+    f"API_PASSPHRASE_masked={(API_PASSPHRASE[:2] + '...' + API_PASSPHRASE[-2:]) if API_PASSPHRASE and len(API_PASSPHRASE) > 4 else 'MISSING'} "
+    f"(len={len(API_PASSPHRASE) if API_PASSPHRASE else 0})"
+)
 WEBHOOK_SECRET = _clean_env("WEBHOOK_SECRET")
 ID_INSTANCE = _clean_env("GREEN_API_ID_INSTANCE")
 API_TOKEN = _clean_env("GREEN_API_TOKEN")
@@ -381,7 +389,7 @@ def get_ai_reply(user_text):
                 "temperature": 0.7,
                 "max_tokens": 200,
             },
-            timeout=15,
+            timeout=8,
         )
         data = r.json()
         if r.status_code == 200:
@@ -407,8 +415,6 @@ def handle_command(text, chat_id):
 
 def _handle_command_inner(text, chat_id):
     text = text.strip().lower()
-    with trading_lock:
-        state = load_state()
 
     if text.startswith("buy"):
         parts = text.split()
@@ -513,7 +519,7 @@ def webhook(secret_token):
             chat_id = data.get("senderData", {}).get("chatId", "")
             logging.info(f"Webhook diag: received chat_id={chat_id!r} expected={MY_PHONE_CHAT_ID!r} match={chat_id == MY_PHONE_CHAT_ID} text={text!r}")
             if chat_id == MY_PHONE_CHAT_ID:
-                # Bounded wait: start the work in a thread, wait up to 25s for it
+                # Bounded wait: start the work in a thread, wait up to 35s for it
                 # to finish before returning. This gives the reply time to actually
                 # go out before the HTTP response completes (avoiding the original
                 # bug where Render's free-tier spin-down cut off a fire-and-forget
@@ -523,9 +529,9 @@ def webhook(secret_token):
                 # killed (which is what caused the 500s and worker restarts).
                 t = threading.Thread(target=handle_command, args=(text, chat_id), daemon=True)
                 t.start()
-                t.join(timeout=25)
+                t.join(timeout=35)
                 if t.is_alive():
-                    logging.warning("handle_command still running after 25s — returning response, thread continues in background.")
+                    logging.warning("handle_command still running after 35s — returning response, thread continues in background.")
             else:
                 logging.warning(f"Webhook: chat_id mismatch, message ignored. Full payload: {json.dumps(data)[:500]}")
     except Exception:
