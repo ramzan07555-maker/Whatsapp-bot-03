@@ -110,9 +110,15 @@ def get_price():
 
 
 def get_balances():
-    endpoint = "/api/v1/accounts"
+    # KuCoin requires the query string to be included in the signed string for
+    # GET/DELETE requests — build the full path+query upfront and sign THAT,
+    # rather than signing the bare path and letting requests' params= silently
+    # add the query string afterward (which was causing every single request
+    # to fail with "Invalid KC-API-SIGN", regardless of how correct the
+    # credentials were).
+    endpoint = "/api/v1/accounts?type=trade"
     headers = _kucoin_headers(endpoint, "GET")
-    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params={"type": "trade"}, timeout=7)
+    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, timeout=7)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != "200000":
