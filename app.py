@@ -96,7 +96,7 @@ def _kucoin_headers(endpoint, method, body=""):
     passphrase = base64.b64encode(hmac.new(API_SECRET.encode(), API_PASSPHRASE.encode(), hashlib.sha256).digest()).decode()
     return {
         "KC-API-KEY": API_KEY, "KC-API-SIGN": signature, "KC-API-TIMESTAMP": ts,
-        "KC-API-PASSPHRASE": passphrase, "KC-API-KEY-VERSION": "2", "Content-Type": "application/json",
+        "KC-API-PASSPHRASE": passphrase, "KC-API-KEY-VERSION": "3", "Content-Type": "application/json",
     }
 
 
