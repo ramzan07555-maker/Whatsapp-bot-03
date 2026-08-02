@@ -10,7 +10,9 @@ import sys
 import threading
 import time
 
+import pandas as pd
 import requests
+import yfinance as yf
 from flask import Flask, abort, request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -68,6 +70,7 @@ background_thread_ref = None
 DEFAULT_STATE = {
     "in_position": False, "entry_price": 0.0, "entry_qty": 0.0,
     "last_buy_amount": 0.0, "total_realized_profit_usdt": 0.0, "stop_order_id": None,
+    "pending_reentry": False, "uptrend_confirm_count": 0,
 }
 
 
@@ -221,6 +224,45 @@ def send_whatsapp(message, chat_id=None):
     return False
 
 
+# --- TREND FILTER (blocks auto re-buy during a falling market) ---
+TREND_SHORT_PERIOD = int(_clean_env("TREND_SHORT_PERIOD", "5"))
+TREND_LONG_PERIOD = int(_clean_env("TREND_LONG_PERIOD", "20"))
+TREND_CONFIRM_CYCLES = int(_clean_env("TREND_CONFIRM_CYCLES", "3"))
+
+
+def get_recent_closes(limit):
+    end_time = int(time.time())
+    start_time = end_time - (limit + 5) * 60
+    params = {"symbol": SYMBOL, "type": "1min", "startAt": start_time, "endAt": end_time}
+    r = requests.get(f"{BASE_URL}/api/v1/market/candles", params=params, timeout=7)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != "200000":
+        raise RuntimeError(f"Kline fetch failed: {data}")
+    candles = data.get("data", [])
+    closes = [float(c[2]) for c in candles]
+    closes.reverse()
+    return closes
+
+
+def is_downtrend():
+    """Short SMA < Long SMA means price has been falling recently —
+    used to skip auto re-buy and avoid repeated stop-loss losses."""
+    try:
+        closes = get_recent_closes(TREND_LONG_PERIOD)
+        if len(closes) < TREND_LONG_PERIOD:
+            logging.warning("Not enough kline data for trend check — allowing re-buy.")
+            return False
+        short_sma = sum(closes[-TREND_SHORT_PERIOD:]) / TREND_SHORT_PERIOD
+        long_sma = sum(closes[-TREND_LONG_PERIOD:]) / TREND_LONG_PERIOD
+        downtrend = short_sma < long_sma
+        logging.info(f"Trend check: short={short_sma:.2f} long={long_sma:.2f} downtrend={downtrend}")
+        return downtrend
+    except Exception as e:
+        logging.error(f"Trend check failed: {e} — allowing re-buy by default.")
+        return False
+
+
 # --- RECONCILIATION (catches state/exchange mismatches, including native stop-loss triggers) ---
 def reconcile_state():
     with trading_lock:
@@ -244,7 +286,13 @@ def reconcile_state():
                 save_state(state)
                 send_whatsapp(f"🛡️ Stop-loss appears to have triggered (position closed on exchange).")
                 if amount >= MIN_TRADE_USDT and usdt >= amount:
-                    do_buy(state, price, amount, reason="auto re-entry after stop-loss")
+                    if is_downtrend():
+                        state["pending_reentry"] = True
+                        state["uptrend_confirm_count"] = 0
+                        save_state(state)
+                        send_whatsapp(f"⏸️ Stop-loss triggered. Skipping auto re-buy — market looks like a downtrend. I'll keep watching and auto re-buy once the trend turns back up ({TREND_CONFIRM_CYCLES} cycles of confirmation needed). You can also send 'buy <amount>' manually anytime to re-enter now.")
+                    else:
+                        do_buy(state, price, amount, reason="auto re-entry after stop-loss")
                 else:
                     send_whatsapp(f"⚠️ Can't auto re-buy (need {amount:.2f}, have {usdt:.2f} USDT). Send 'buy <amount>' when ready.")
             elif not state["in_position"] and btc_value >= MIN_TRADE_USDT:
@@ -310,9 +358,49 @@ def do_sell(state, price, reason):
     save_state(state)
 
 
+# --- PENDING RE-ENTRY (waits out a downtrend, then auto re-buys once it clears) ---
+def check_pending_reentry():
+    with trading_lock:
+        state = load_state()
+        if state["in_position"] or not state.get("pending_reentry"):
+            return
+        amount = state.get("last_buy_amount", 0)
+        try:
+            usdt, _ = get_balances()
+        except Exception as e:
+            logging.error(f"Pending re-entry balance check failed: {e}")
+            return
+        if amount < MIN_TRADE_USDT or usdt < amount:
+            # Balance no longer sufficient — stop watching, let the user re-buy manually.
+            state["pending_reentry"] = False
+            save_state(state)
+            send_whatsapp(f"⚠️ Was waiting to re-buy after the downtrend cleared, but balance is now insufficient (need {amount:.2f}, have {usdt:.2f} USDT). Send 'buy <amount>' when ready.")
+            return
+        if is_downtrend():
+            if state.get("uptrend_confirm_count", 0) != 0:
+                state["uptrend_confirm_count"] = 0
+                save_state(state)
+                logging.info("Pending re-entry: downtrend again, confirmation count reset to 0.")
+            else:
+                logging.info("Pending re-entry: still a downtrend, continuing to wait.")
+            return
+
+        state["uptrend_confirm_count"] = state.get("uptrend_confirm_count", 0) + 1
+        save_state(state)
+        logging.info(f"Pending re-entry: non-downtrend cycle {state['uptrend_confirm_count']}/{TREND_CONFIRM_CYCLES}.")
+        if state["uptrend_confirm_count"] < TREND_CONFIRM_CYCLES:
+            return
+
+        price = get_price()
+        state["pending_reentry"] = False
+        state["uptrend_confirm_count"] = 0
+        do_buy(state, price, amount, reason="auto re-entry after downtrend cleared")
+
+
 # --- HOURLY CYCLE (profit-take / stop-loss check) ---
 def run_cycle():
     reconcile_state()  # also detects & handles a triggered native stop-loss order
+    check_pending_reentry()  # if we're waiting out a downtrend, see if it has cleared
     with trading_lock:
         state = load_state()
         if not state["in_position"]:
@@ -328,7 +416,13 @@ def run_cycle():
             usdt, _ = get_balances()
             amount = state.get("last_buy_amount", 0)
             if amount >= MIN_TRADE_USDT and usdt >= amount:
-                do_buy(state, price, amount, reason="auto re-entry after profit")
+                if is_downtrend():
+                    state["pending_reentry"] = True
+                    state["uptrend_confirm_count"] = 0
+                    save_state(state)
+                    send_whatsapp(f"⏸️ Sold for profit. Skipping auto re-buy — market looks like a downtrend. I'll keep watching and auto re-buy once the trend turns back up ({TREND_CONFIRM_CYCLES} cycles of confirmation needed). You can also send 'buy <amount>' manually anytime to re-enter now.")
+                else:
+                    do_buy(state, price, amount, reason="auto re-entry after profit")
             else:
                 send_whatsapp(f"⚠️ Sold for profit but can't auto re-buy (need {amount:.2f}, have {usdt:.2f} USDT). Send 'buy <amount>' when ready.")
         # Stop-loss is now handled by the native KuCoin stop order (near-instant,
@@ -365,7 +459,167 @@ def _start_background_loop_once():
 _start_background_loop_once()
 
 
-# --- CASUAL AI CHAT (Groq) — completely separate from trading logic. ---
+# --- S&P 500 TOP-10 LIST (data compilation only — bot never picks a company to buy) ---
+SP500_LIST_SIZE = int(_clean_env("SP500_LIST_SIZE", "10"))
+_sp500_cache = {"tickers": None, "fetched_at": 0}
+_SP500_CACHE_TTL = 86400  # refetch the Wikipedia list at most once a day
+
+
+def fetch_sp500_top_n(n):
+    now = time.time()
+    if _sp500_cache["tickers"] and (now - _sp500_cache["fetched_at"] < _SP500_CACHE_TTL):
+        return _sp500_cache["tickers"][:n]
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    tables = pd.read_html(url)
+    sp500_table = tables[0]
+    symbols = sp500_table["Symbol"].tolist()
+    symbols = [s.replace(".", "-") for s in symbols]
+    _sp500_cache["tickers"] = symbols
+    _sp500_cache["fetched_at"] = now
+    return symbols[:n]
+
+
+def fetch_stock_metrics(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+        fifty_two_wk_high = info.get("fiftyTwoWeekHigh")
+        target_mean_price = info.get("targetMeanPrice")
+        revenue_growth = info.get("revenueGrowth")
+        earnings_growth = info.get("earningsGrowth")
+        profit_margins = info.get("profitMargins")
+        recommendation = info.get("recommendationKey", "n/a")
+        name = info.get("shortName", ticker)
+        if current_price is None or fifty_two_wk_high is None:
+            return None
+        return {
+            "ticker": ticker, "name": name, "current_price": current_price,
+            "fifty_two_wk_high": fifty_two_wk_high, "target_mean_price": target_mean_price,
+            "revenue_growth": revenue_growth, "earnings_growth": earnings_growth,
+            "profit_margins": profit_margins, "recommendation": recommendation,
+        }
+    except Exception as e:
+        logging.warning(f"Stock metrics fetch failed for {ticker}: {e}")
+        return None
+
+
+def _normalize(value, min_val, max_val):
+    if value is None or max_val == min_val:
+        return 50.0
+    pct = (value - min_val) / (max_val - min_val) * 100
+    return max(0.0, min(100.0, pct))
+
+
+def compute_stock_scores(companies):
+    rev_growths = [c["revenue_growth"] for c in companies if c["revenue_growth"] is not None]
+    earn_growths = [c["earnings_growth"] for c in companies if c["earnings_growth"] is not None]
+    margins = [c["profit_margins"] for c in companies if c["profit_margins"] is not None]
+
+    discounts, upsides = [], []
+    for c in companies:
+        c["discount_pct"] = ((c["fifty_two_wk_high"] - c["current_price"]) / c["fifty_two_wk_high"] * 100
+                              if c["fifty_two_wk_high"] else None)
+        if c["discount_pct"] is not None:
+            discounts.append(c["discount_pct"])
+        c["upside_pct"] = ((c["target_mean_price"] - c["current_price"]) / c["current_price"] * 100
+                            if c["target_mean_price"] else None)
+        if c["upside_pct"] is not None:
+            upsides.append(c["upside_pct"])
+
+    rg_min, rg_max = (min(rev_growths), max(rev_growths)) if rev_growths else (0, 1)
+    eg_min, eg_max = (min(earn_growths), max(earn_growths)) if earn_growths else (0, 1)
+    m_min, m_max = (min(margins), max(margins)) if margins else (0, 1)
+    dh_min, dh_max = (min(discounts), max(discounts)) if discounts else (0, 1)
+    dt_min, dt_max = (min(upsides), max(upsides)) if upsides else (0, 1)
+
+    for c in companies:
+        rg_score = _normalize(c["revenue_growth"], rg_min, rg_max)
+        eg_score = _normalize(c["earnings_growth"], eg_min, eg_max)
+        m_score = _normalize(c["profit_margins"], m_min, m_max)
+        c["growth_score"] = (rg_score + eg_score + m_score) / 3
+
+        dh_score = _normalize(c["discount_pct"], dh_min, dh_max)
+        dt_score = _normalize(c["upside_pct"], dt_min, dt_max)
+        c["value_score"] = (dh_score + dt_score) / 2
+
+        c["overall_score"] = (c["growth_score"] + c["value_score"]) / 2
+    return companies
+
+
+def categorize_stock(c):
+    if c["growth_score"] >= 60 and c["value_score"] >= 60:
+        return "🟢 High Growth + අඩු මිලට"
+    elif c["growth_score"] >= 60:
+        return "📈 High Growth"
+    elif c["value_score"] >= 60:
+        return "💰 Value stock"
+    elif c["overall_score"] >= 40:
+        return "🟡 Balanced"
+    else:
+        return "🔴 දුර්වල"
+
+
+def get_short_sinhala_note(ticker, name, category, growth_pct, discount_pct):
+    """One short Sinhala sentence per company via Groq — factual, not a recommendation."""
+    if not GROQ_API_KEY:
+        return ""
+    try:
+        prompt = (
+            f"Company: {name} ({ticker}). Category: {category}. "
+            f"Revenue growth: {growth_pct}. Trading {discount_pct} below 52-week high. "
+            f"Write ONE short, factual sentence in Sinhala summarizing this company's current "
+            f"situation. Do NOT recommend buying or selling. Just state the facts plainly."
+        )
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3, "max_tokens": 100,
+            },
+            timeout=10,
+        )
+        data = r.json()
+        if r.status_code == 200:
+            return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logging.warning(f"Sinhala note generation failed for {ticker}: {e}")
+    return ""
+
+
+def build_stock_list_message():
+    tickers = fetch_sp500_top_n(SP500_LIST_SIZE)
+    companies = []
+    for t in tickers:
+        m = fetch_stock_metrics(t)
+        if m:
+            companies.append(m)
+    if not companies:
+        return "S&P 500 data ලබාගන්න බැරි වුණා. පස්සේ try කරන්න."
+
+    companies = compute_stock_scores(companies)
+    companies.sort(key=lambda c: c["overall_score"], reverse=True)
+
+    lines = [f"📊 S&P 500 Top {len(companies)} (data-driven, recommendation එකක් නෙවෙයි)\n"]
+    for c in companies:
+        category = categorize_stock(c)
+        growth_pct = f"{c['revenue_growth']*100:.1f}%" if c["revenue_growth"] is not None else "n/a"
+        discount_pct = f"{c['discount_pct']:.1f}%" if c["discount_pct"] is not None else "n/a"
+        note = get_short_sinhala_note(c["ticker"], c["name"], category, growth_pct, discount_pct)
+        lines.append(
+            f"\n{c['ticker']} — {c['name']}\n"
+            f"${c['current_price']:.2f} | {category} | Score: {c['overall_score']:.0f}%\n"
+            f"{note}"
+        )
+    lines.append(
+        "\n\n⚠️ මේක data compile කරපු එකක් විතරයි — buy/sell තීරණය ඔබේම. "
+        "'buy TICKER amount' කියලා specific company එකක් නම් කරලා යවන්න."
+    )
+    return "\n".join(lines)
+
+
+
 # This function can only ever return a text reply; it has no access to do_buy/
 # do_sell/place_market_* and cannot execute trades under any circumstances.
 # Trading commands are matched and handled deterministically in handle_command()
@@ -445,7 +699,14 @@ def _handle_command_inner(text, chat_id):
                 send_whatsapp(f"Insufficient balance. Need {amount:.2f}, have {usdt:.2f} USDT.", chat_id)
                 return
             price = get_price()
+            state["pending_reentry"] = False
+            state["uptrend_confirm_count"] = 0
             do_buy(state, price, amount, reason="manual command")
+
+    elif text == "list":
+        send_whatsapp("S&P 500 list එක ready කරමින්... (මිනිත්තු කිහිපයක් යනවා)", chat_id)
+        msg = build_stock_list_message()
+        send_whatsapp(msg, chat_id)
 
     elif text == "sell":
         with trading_lock:
@@ -471,9 +732,12 @@ def _handle_command_inner(text, chat_id):
                    f"Stop-loss: {STOP_LOSS_PCT*100:.1f}%\nTotal realized: {state.get('total_realized_profit_usdt', 0):+.4f} USDT\n"
                    f"USDT: {usdt:.2f} | BTC: {btc:.8f}")
         else:
+            waiting_note = ""
+            if state.get("pending_reentry"):
+                waiting_note = f"\n⏳ Waiting for downtrend to clear ({state.get('uptrend_confirm_count', 0)}/{TREND_CONFIRM_CYCLES} confirmation cycles) before auto re-buying."
             msg = (f"📊 Status\nIn position: NO\nLast buy amount: {state.get('last_buy_amount', 0):.2f}\n"
                    f"Total realized: {state.get('total_realized_profit_usdt', 0):+.4f} USDT\n"
-                   f"USDT: {usdt:.2f} | BTC: {btc:.8f}\nSend 'buy <amount>' to open a position.")
+                   f"USDT: {usdt:.2f} | BTC: {btc:.8f}\nSend 'buy <amount>' to open a position.{waiting_note}")
         send_whatsapp(msg, chat_id)
 
     else:
@@ -505,7 +769,6 @@ def webhook(secret_token):
         abort(403)
 
     data = request.json or {}
-
     # Green API sends webhooks for several event types — incoming messages,
     # but also delivery/status updates about messages WE sent (outgoingMessageStatus,
     # outgoingAPIMessageReceived, etc). Without this check, the bot's own replies
@@ -542,7 +805,6 @@ def webhook(secret_token):
                 logging.warning(f"Webhook: chat_id mismatch, message ignored. Full payload: {json.dumps(data)[:500]}")
     except Exception:
         logging.exception("Webhook processing error")
-
     return "OK", 200
 
 
@@ -557,7 +819,6 @@ def shutdown_handler(signum=None, frame=None):
 
 signal.signal(signal.SIGTERM, shutdown_handler)
 signal.signal(signal.SIGINT, shutdown_handler)
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
