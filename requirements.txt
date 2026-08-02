@@ -3,3 +3,6 @@ requests
 groq
 gunicorn
 pybit
+pandas
+yfinance
+lxml
